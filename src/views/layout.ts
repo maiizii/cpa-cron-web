@@ -199,6 +199,29 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
     };
   })();
 
+  window.formatChinaTime = function(value) {
+    if (!value) return '-';
+    const raw = String(value).trim();
+    if (!raw) return '-';
+    let date = null;
+    if (/^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$/.test(raw)) {
+      date = new Date(raw.replace(' ', 'T') + 'Z');
+    } else {
+      date = new Date(raw);
+    }
+    if (Number.isNaN(date.getTime())) return raw;
+    return new Intl.DateTimeFormat('zh-CN', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }).format(date).replace(/\\//g, '-');
+  };
+
   async function api(path, opts = {}) {
     const token = localStorage.getItem('cpa_token') || '';
     const headers = { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}), ...opts.headers };

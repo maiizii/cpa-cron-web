@@ -300,12 +300,37 @@ export async function getDashboardStats(db: D1Database): Promise<Record<string, 
     db.prepare('SELECT COUNT(*) as cnt FROM auth_accounts WHERE probe_error_kind IS NOT NULL AND probe_error_kind != \'\''),
     db.prepare('SELECT * FROM scan_runs ORDER BY run_id DESC LIMIT 1'),
     db.prepare('SELECT * FROM activity_log ORDER BY id DESC LIMIT 10'),
+    db.prepare("SELECT created_at FROM activity_log WHERE action = 'cron_maintain_started' ORDER BY id DESC LIMIT 1"),
+    db.prepare("SELECT created_at FROM activity_log WHERE action = 'cron_maintain_completed' ORDER BY id DESC LIMIT 1"),
+    db.prepare("SELECT created_at FROM activity_log WHERE action = 'cron_maintain_failed' ORDER BY id DESC LIMIT 1"),
   ]);
 
   const cnt = (r: D1Result, idx = 0) => {
     const rows = r.results as Record<string, unknown>[];
     return rows.length > 0 ? Number((rows[idx] as Record<string, unknown>).cnt ?? 0) : 0;
   };
+
+  const cronStarted = ((stats[9].results as Record<string, unknown>[])[0]?.created_at as string | undefined) ?? null;
+  const cronCompleted = ((stats[10].results as Record<string, unknown>[])[0]?.created_at as string | undefined) ?? null;
+  const cronFailed = ((stats[11].results as Record<string, unknown>[])[0]?.created_at as string | undefined) ?? null;
+
+  let cronDurationSeconds: number | null = null;
+  if (cronStarted && cronCompleted) {
+    const startMs = Date.parse(cronStarted.replace(' ', 'T') + 'Z');
+    const endMs = Date.parse(cronCompleted.replace(' ', 'T') + 'Z');
+    if (Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs) {
+      cronDurationSeconds = Math.round((endMs - startMs) / 1000);
+    }
+  }
+
+  let cronStatus: 'success' | 'failed' | 'running' | 'never' = 'never';
+  if (cronCompleted) {
+    cronStatus = 'success';
+  } else if (cronFailed) {
+    cronStatus = 'failed';
+  } else if (cronStarted) {
+    cronStatus = 'running';
+  }
 
   return {
     total_accounts: cnt(stats[0]),
@@ -317,6 +342,12 @@ export async function getDashboardStats(db: D1Database): Promise<Record<string, 
     probe_errors: cnt(stats[6]),
     last_scan: (stats[7].results as Record<string, unknown>[])[0] ?? null,
     recent_activity: stats[8].results as Record<string, unknown>[],
+    cron_summary: {
+      last_started_at: cronStarted,
+      last_completed_at: cronCompleted,
+      last_duration_seconds: cronDurationSeconds,
+      last_status: cronStatus,
+    },
   };
 }
 

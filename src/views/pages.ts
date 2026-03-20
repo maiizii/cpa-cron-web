@@ -5,6 +5,29 @@ type AccountsInitialData = {
   total: number;
 };
 
+function formatChinaTimeText(value: unknown): string {
+  if (!value) return '-';
+  const raw = String(value).trim();
+  if (!raw) return '-';
+  let date: Date;
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw)) {
+    date = new Date(raw.replace(' ', 'T') + 'Z');
+  } else {
+    date = new Date(raw);
+  }
+  if (Number.isNaN(date.getTime())) return raw;
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(date).replace(/\//g, '-');
+}
+
 export function dashboardPage(): string {
   return htmlLayout('仪表盘', `
 <div id="statsContainer"><div class="spinner" style="margin:40px auto;display:block"></div></div>
@@ -48,7 +71,7 @@ export function dashboardPage(): string {
         运行ID: \${s.run_id} | 模式: \${s.mode} | 状态: <span class="badge \${s.status==='success'?'badge-success':'badge-danger'}">\${s.status}</span><br>
         总文件: \${s.total_files} | 过滤: \${s.filtered_files} | 探测: \${s.probed_files}<br>
         401: \${s.invalid_401_count} | 限额: \${s.quota_limited_count} | 恢复: \${s.recovered_count}<br>
-        开始: \${s.started_at || '-'} | 结束: \${s.finished_at || '-'}
+        开始: \${window.formatChinaTime(s.started_at)} | 结束: \${window.formatChinaTime(s.finished_at)}
       </p>
     \`;
   } else {
@@ -74,7 +97,12 @@ export function dashboardPage(): string {
     return expr;
   }
 
+  function fmtDashboardTime(value) {
+    return window.formatChinaTime(value);
+  }
+
   const cron = data.cron || {};
+  const cronSummary = data.cron_summary || {};
   const cronExpr = cron.cron_expression || '*/30 * * * *';
   const cronState = cron.cron_last_result || '未运行';
   const cronBadge = cronState === 'success'
@@ -85,18 +113,30 @@ export function dashboardPage(): string {
         ? 'badge-info'
         : 'badge-warning';
   document.getElementById('cronStatus').innerHTML = \`
-    <p style="font-size:13px;color:var(--text-dim)">
-      执行频率: \${cronToHuman(cronExpr)} <code style="opacity:0.5;margin-left:6px">\${cronExpr}</code><br>
-      上次执行: \${cron.cron_last_run_at || '-'}<br>
-      上次结果: <span class="badge \${cronBadge}">\${cronState}</span><br>
-      最近失败原因: \${cron.cron_last_error || '-'}
-    </p>
+    <div style="display:flex;flex-direction:column;gap:10px;font-size:13px;color:var(--text-dim)">
+      <div>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+          <span style="font-weight:600;color:var(--text)">执行频率</span>
+          <span class="badge badge-info">\${cronToHuman(cronExpr)}</span>
+          <code style="opacity:0.5">\${cronExpr}</code>
+        </div>
+        <div>上次触发: \${fmtDashboardTime(cron.cron_last_run_at)}</div>
+        <div>当前结果: <span class="badge \${cronBadge}">\${cronState}</span></div>
+      </div>
+      <div style="padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:rgba(116,185,255,.05)">
+        <div style="font-weight:600;color:var(--text);margin-bottom:6px">最近一次定时执行</div>
+        <div>开始于: \${fmtDashboardTime(cronSummary.last_started_at)}</div>
+        <div>成功于: \${fmtDashboardTime(cronSummary.last_completed_at)}</div>
+        <div>耗时: \${cronSummary.last_duration_seconds != null ? cronSummary.last_duration_seconds + ' 秒' : '-'}</div>
+      </div>
+      <div>最近失败原因: \${cron.cron_last_error || '-'}</div>
+    </div>
   \`;
 
   const tbody = document.getElementById('activityBody');
   if (data.recent_activity?.length) {
     tbody.innerHTML = data.recent_activity.map(a => \`
-      <tr><td><span class="badge badge-info">\${a.action}</span></td><td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${a.detail||'-'}</td><td>\${a.username||'-'}</td><td style="white-space:nowrap">\${a.created_at||'-'}</td></tr>
+      <tr><td><span class="badge badge-info">\${a.action}</span></td><td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${a.detail||'-'}</td><td>\${a.username||'-'}</td><td style="white-space:nowrap">\${window.formatChinaTime(a.created_at)}</td></tr>
     \`).join('');
   } else {
     tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text-dim)">暂无记录</td></tr>';
@@ -116,7 +156,7 @@ export function accountsPage(initialData?: AccountsInitialData): string {
       <td>${String(r.provider || '-')}</td>
       <td>${Number(r.is_invalid_401 || 0) === 1 ? '<span class="badge badge-danger">401</span>' : Number(r.disabled || 0) === 1 && Number(r.is_quota_limited || 0) === 1 ? '<span class="badge badge-warning">限额已禁用</span>' : Number(r.is_quota_limited || 0) === 1 ? '<span class="badge badge-warning">限额</span>' : Number(r.disabled || 0) === 1 && Number(r.is_recovered || 0) === 1 ? '<span class="badge badge-info">可恢复</span>' : Number(r.is_recovered || 0) === 1 ? '<span class="badge badge-info">恢复</span>' : Number(r.disabled || 0) === 1 ? '<span class="badge badge-dim">禁用</span>' : r.probe_error_kind ? '<span class="badge badge-warning">异常</span>' : '<span class="badge badge-success">有效</span>'}</td>
       <td>${r.api_status_code != null ? String(r.api_status_code) : '-'}</td>
-      <td style="white-space:nowrap;font-size:12px">${String(r.updated_at || '').slice(0, 19)}</td>
+      <td style="white-space:nowrap;font-size:12px">${formatChinaTimeText(r.updated_at)}</td>
       <td>
         <button class="btn btn-sm ${Number(r.disabled || 0) === 1 ? 'btn-primary' : 'btn-outline'}" onclick="toggleAccount('${encodeURIComponent(String(r.name || ''))}',${Number(r.disabled || 0) !== 1})">${Number(r.disabled || 0) === 1 ? '启用' : '禁用'}</button>
         <button class="btn btn-danger btn-sm" onclick="deleteAcc('${encodeURIComponent(String(r.name || ''))}')">删除</button>
@@ -184,9 +224,7 @@ function syncPager() {
 }
 
 function fmtTime(value) {
-  if (!value) return '-';
-  const s = String(value).replace('T', ' ');
-  return s.slice(0, 19);
+  return window.formatChinaTime(value);
 }
 
 async function refreshAccountMeta() {
@@ -280,7 +318,7 @@ async function loadAccounts() {
       <td>\${r.provider||'-'}</td>
       <td>\${statusBadge(r)}</td>
       <td>\${r.api_status_code!=null?r.api_status_code:'-'}</td>
-      <td style="white-space:nowrap;font-size:12px">\${(r.updated_at||'').slice(0,19)}</td>
+      <td style="white-space:nowrap;font-size:12px">\${window.formatChinaTime(r.updated_at)}</td>
       <td>
         <button class="btn btn-sm \${r.disabled?'btn-primary':'btn-outline'}" onclick="toggleAccount('\${encodeURIComponent(r.name)}',\${!r.disabled})">\${r.disabled?'启用':'禁用'}</button>
         <button class="btn btn-danger btn-sm" onclick="deleteAcc('\${encodeURIComponent(r.name)}')">删除</button>
@@ -794,8 +832,8 @@ async function load() {
       <td><span class="badge \${r.status==='success'?'badge-success':'badge-danger'}">\${r.status}</span></td>
       <td>\${r.total_files}</td><td>\${r.filtered_files}</td><td>\${r.probed_files}</td>
       <td>\${r.invalid_401_count}</td><td>\${r.quota_limited_count}</td><td>\${r.recovered_count}</td>
-      <td style="white-space:nowrap;font-size:12px">\${(r.started_at||'').slice(0,19)}</td>
-      <td style="white-space:nowrap;font-size:12px">\${(r.finished_at||'').slice(0,19)}</td>
+      <td style="white-space:nowrap;font-size:12px">\${window.formatChinaTime(r.started_at)}</td>
+      <td style="white-space:nowrap;font-size:12px">\${window.formatChinaTime(r.finished_at)}</td>
     </tr>
   \`).join('');
 }
@@ -836,7 +874,7 @@ async function load() {
       <td><span class="badge badge-info">\${r.action}</span></td>
       <td style="max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${r.detail||'-'}</td>
       <td>\${r.username||'-'}</td>
-      <td style="white-space:nowrap;font-size:12px">\${(r.created_at||'').slice(0,19)}</td>
+      <td style="white-space:nowrap;font-size:12px">\${window.formatChinaTime(r.created_at)}</td>
     </tr>
   \`).join('');
 }

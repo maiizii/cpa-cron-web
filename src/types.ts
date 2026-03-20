@@ -169,4 +169,10 @@ export interface DashboardStats {
   probe_errors: number;
   last_scan: ScanRun | null;
   recent_activity: ActivityRecord[];
+  cron_summary?: {
+    last_started_at: string | null;
+    last_completed_at: string | null;
+    last_duration_seconds: number | null;
+    last_status: 'success' | 'failed' | 'running' | 'never';
+  };
 }
