@@ -1,0 +1,27 @@
+name = "cpa-cron-web"
+main = "src/index.ts"
+compatibility_date = "2025-03-15"
+compatibility_flags = ["nodejs_compat"]
+
+[triggers]
+# Every 30 minutes: auto maintain accounts (scan + clear 401 + handle quota + re-enable recovered)
+crons = ["*/30 * * * *"]
+
+# D1 Database — run `wrangler d1 create cpa-warden-db` and fill in the database_id
+[[d1_databases]]
+binding = "DB"
+database_name = "cpa-warden-db"
+database_id = "<YOUR_D1_DATABASE_ID>"
+
+# KV Namespace — run `wrangler kv namespace create KV` and fill in the id
+[[kv_namespaces]]
+binding = "KV"
+id = "<YOUR_KV_NAMESPACE_ID>"
+
+# Environment variables (set via wrangler secret or dashboard)
+# ADMIN_USERNAME - admin login username (default: admin)
+# ADMIN_PASSWORD - initial admin password (recommended for first deploy)
+# ADMIN_PASSWORD_HASH - bcrypt hash of admin password (optional alternative)
+# JWT_SECRET - secret for signing JWT tokens (required in production)
+# CPA_BASE_URL - optional fallback CPA management base URL
+# CPA_TOKEN - optional fallback CPA management token

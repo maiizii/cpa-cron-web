@@ -1,0 +1,47 @@
+{
+  "name": "cpa-cron-web",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "npm run db:migrate:remote && wrangler deploy",
+    "db:migrate": "wrangler d1 migrations apply DB --local",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote"
+  },
+  "cloudflare": {
+    "bindings": {
+      "DB": {
+        "description": "D1 database for accounts, tasks, activity logs, scan history, and system config."
+      },
+      "KV": {
+        "description": "KV namespace reserved for lightweight Worker-side state and future session/config extensions."
+      },
+      "CPA_BASE_URL": {
+        "description": "Optional default CPA management base URL. Used as a fallback when the admin panel has not saved `base_url` yet."
+      },
+      "CPA_TOKEN": {
+        "description": "Optional default CPA management token. Used as a fallback when the admin panel has not saved `token` yet."
+      },
+      "ADMIN_USERNAME": {
+        "description": "Optional initial admin username. Defaults to `admin` when `ADMIN_PASSWORD` or `ADMIN_PASSWORD_HASH` is provided."
+      },
+      "ADMIN_PASSWORD": {
+        "description": "Recommended for first deploy. Set a strong initial admin password; it will be hashed on first initialization."
+      },
+      "ADMIN_PASSWORD_HASH": {
+        "description": "Optional pre-hashed admin password if you do not want to provide plain text `ADMIN_PASSWORD`."
+      },
+      "JWT_SECRET": {
+        "description": "Set a long random secret for signing login tokens, for example via `openssl rand -hex 32`."
+      }
+    }
+  },
+  "dependencies": {
+    "hono": "^4.7.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250312.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.0.0"
+  }
+}
