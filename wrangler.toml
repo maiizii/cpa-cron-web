@@ -11,12 +11,12 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "cpa-warden-db"
-database_id = "<YOUR_D1_DATABASE_ID>"
+database_id = "8d411d91-6995-4548-b339-4adb42799fe6"
 
 # KV Namespace — run `wrangler kv namespace create KV` and fill in the id
 [[kv_namespaces]]
 binding = "KV"
-id = "<YOUR_KV_NAMESPACE_ID>"
+id = "90fef98c16fc420fb90f572a59062e0a"
 
 # Environment variables (set via wrangler secret or dashboard)
 # ADMIN_USERNAME - admin login username (default: admin)
