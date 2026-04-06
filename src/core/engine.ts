@@ -298,82 +298,81 @@ export async function runScan(
       });
 
       const itemTimeoutMs = Math.max(5000, (config.timeout + Math.max(0, config.retries) * config.timeout + 5) * 1000);
-      const tasks = batch.map((record) => async () => {
-        const name = String(record.name ?? '');
-        return await withTimeout(
-          probeWhamUsage(
-            config.base_url,
-            config.token,
-            record,
-            config.timeout,
-            config.retries,
-            config.user_agent,
-            config.quota_disable_threshold
-          ),
-          itemTimeoutMs,
-          `probe ${name || 'unknown'}`
-        );
-      });
-      const batchResults = await withTimeout(
-        runTasksWithProgress(
-          tasks,
-          probeConcurrency,
-          async (index) => {
-            await safeTaskUpdate(db, taskId, {
-              progress: probed + index,
-              result: JSON.stringify({
-                phase: 'probing',
-                probed,
-                total_files: files.length,
-                filtered: total,
-                current_batch: batchLabel,
-                current_item: String(batch[index]?.name ?? ''),
-                current_step: 'probe_item_start',
-                current_index: probed + index + 1,
-              }),
-            });
-          },
-          async (index, result) => {
-            const now = new Date().toISOString();
-            const merged = { ...result, updated_at: now } as Record<string, unknown>;
-            const name = String(merged.name ?? batch[index]?.name ?? '');
-            const original = inventoryByName.get(name);
-            if (original) Object.assign(original, merged);
-            const upsertResult = await safeAccountUpsert(db, merged);
-            if (!upsertResult.ok) {
-              merged.probe_error_kind = 'db_write_timeout';
-              merged.probe_error_text = upsertResult.error ?? 'auth_accounts write failed';
-              if (original) Object.assign(original, merged);
-            }
-            await safeTaskUpdate(db, taskId, {
-              progress: probed + index + 1,
-              result: JSON.stringify({
-                phase: 'probing',
-                probed: probed + index + 1,
-                total_files: files.length,
-                filtered: total,
-                current_batch: batchLabel,
-                current_item: name,
-                current_step: 'probe_item_done',
-                current_index: probed + index + 1,
-                last_error: merged.probe_error_text ?? null,
-              }),
-            });
-          },
-          async (index, error) => ({
-            ...batch[index],
+
+      for (let index = 0; index < batch.length; index++) {
+        const record = batch[index];
+        const currentIndex = probed + index + 1;
+        const fallbackName = String(record?.name ?? '');
+
+        await safeTaskUpdate(db, taskId, {
+          progress: probed + index,
+          result: JSON.stringify({
+            phase: 'probing',
+            probed,
+            total_files: files.length,
+            filtered: total,
+            current_batch: batchLabel,
+            current_item: fallbackName,
+            current_step: 'probe_item_start',
+            current_index: currentIndex,
+          }),
+        });
+
+        let merged: Record<string, unknown>;
+        try {
+          const result = await withTimeout(
+            probeWhamUsage(
+              config.base_url,
+              config.token,
+              record,
+              config.timeout,
+              config.retries,
+              config.user_agent,
+              config.quota_disable_threshold
+            ),
+            itemTimeoutMs,
+            `probe ${fallbackName || 'unknown'}`
+          );
+          merged = { ...result, updated_at: new Date().toISOString() } as Record<string, unknown>;
+        } catch (error) {
+          merged = {
+            ...record,
             last_probed_at: new Date().toISOString(),
             probe_error_kind: 'probe_wrapper_error',
             probe_error_text: String(error),
             updated_at: new Date().toISOString(),
-          } as Record<string, unknown>)
-        ),
-        Math.max(15000, batch.length * itemTimeoutMs),
-        `probe batch ${batchLabel}`
-      );
+          } as Record<string, unknown>;
+        }
+
+        const name = String(merged.name ?? fallbackName);
+        const original = inventoryByName.get(name);
+        if (original) Object.assign(original, merged);
+
+        const upsertResult = await safeAccountUpsert(db, merged);
+        if (!upsertResult.ok) {
+          merged.probe_error_kind = 'db_write_timeout';
+          merged.probe_error_text = upsertResult.error ?? 'auth_accounts write failed';
+          if (original) Object.assign(original, merged);
+        }
+
+        await safeTaskUpdate(db, taskId, {
+          progress: currentIndex,
+          result: JSON.stringify({
+            phase: 'probing',
+            probed: currentIndex,
+            total_files: files.length,
+            filtered: total,
+            current_batch: batchLabel,
+            current_item: name,
+            current_step: 'probe_item_done',
+            current_index: currentIndex,
+            last_error: merged.probe_error_text ?? null,
+          }),
+        });
+      }
 
       probed += batch.length;
-      const lastItem = String(batchResults[batchResults.length - 1]?.name ?? batch[batch.length - 1]?.name ?? '');
+      const lastItem = String(batch[batch.length - 1]?.name ?? '');
       await safeTaskUpdate(db, taskId, {
         progress: probed,
         result: JSON.stringify({
