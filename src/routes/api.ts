@@ -20,7 +20,7 @@ import {
   updateTask,
   getAuthAccountsMeta,
 } from '../core/db';
-import { runScan, runMaintain, runUpload, advanceScanTask } from '../core/engine';
+import { runScan, runMaintain, runUpload, advanceScanTask, advanceMaintainTask } from '../core/engine';
 import type { UploadFileItem } from '../core/engine';
 import { deleteAccount, setAccountDisabled } from '../core/cpa-client';
 
@@ -248,9 +248,15 @@ api.post('/operations/maintain', async (c) => {
 
   const user = c.get('user') as Record<string, unknown>;
   const username = String(user?.username ?? '');
-  const taskId = await createTask(c.env.DB, 'maintain', { username });
+  const taskId = await createTask(c.env.DB, 'maintain', { username, mode: 'step_maintain' });
 
-  getCtx(c).waitUntil(runMaintain(c.env.DB, config, taskId, username));
+  await updateTask(c.env.DB, taskId, {
+    status: 'running',
+    started_at: new Date().toISOString(),
+    progress: 0,
+    total: 0,
+    result: JSON.stringify({ phase: 'queued' }),
+  });
 
   return c.json({ ok: true, task_id: taskId });
 });
@@ -339,7 +345,9 @@ api.post('/tasks/:id/advance', async (c) => {
   const id = parseInt(c.req.param('id'), 10);
   const task = await getTaskById(c.env.DB, id);
   if (!task) return c.json({ error: '任务不存在' }, 404);
-  if (String(task.type || '') !== 'scan') return c.json({ error: '仅 scan 任务支持推进' }, 400);
+  if (!['scan', 'maintain'].includes(String(task.type || ''))) {
+    return c.json({ error: '仅 scan / maintain 任务支持推进' }, 400);
+  }
   if (['completed', 'failed', 'stopped'].includes(String(task.status || ''))) {
     return c.json({ ok: true, task_id: id, status: task.status, done: true });
   }
@@ -357,7 +365,9 @@ api.post('/tasks/:id/advance', async (c) => {
 
   const params = task.params ? JSON.parse(String(task.params)) : {};
   const username = String((params && params.username) || '');
-  const result = await advanceScanTask(c.env.DB, config, id, username);
+  const result = String(task.type || '') === 'maintain'
+    ? await advanceMaintainTask(c.env.DB, config, id, username)
+    : await advanceScanTask(c.env.DB, config, id, username);
   const latest = await getTaskById(c.env.DB, id);
   return c.json({ ok: true, task_id: id, status: latest?.status || task.status, result, task: latest });
 });

@@ -45,7 +45,8 @@ const DEFAULT_UPLOAD_CONCURRENCY = 5;
 const MAX_PROBE_CONCURRENCY = 12;
 const MAX_ACTION_CONCURRENCY = 10;
 const MAX_UPLOAD_CONCURRENCY = 8;
-const SCAN_STEP_SIZE = 8;
+const SCAN_STEP_SIZE = 16;
+const MAINTAIN_ACTION_STEP_SIZE = 12;
 
 // ── helpers ──────────────────────────────────────────────────────────
 
@@ -250,6 +251,44 @@ function parseTaskJson(value: unknown): Record<string, unknown> {
 function toFiniteNumber(value: unknown, fallback: number): number {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item)).filter(Boolean);
+}
+
+async function runDeleteBatch(
+  config: AppConfig,
+  names: string[],
+  concurrency: number
+): Promise<Array<{ name: string; ok: boolean; status_code?: number | null; error: string | null; attempts?: number }>> {
+  const tasks = names.map((name) => () =>
+    deleteAccount(config.base_url, config.token, name, config.timeout, config.delete_retries)
+  );
+  return runWithConcurrency(tasks, concurrency);
+}
+
+async function runDisableBatch(
+  config: AppConfig,
+  names: string[],
+  concurrency: number
+): Promise<Array<{ name: string; ok: boolean; status_code?: number | null; error: string | null; attempts?: number; disabled?: boolean }>> {
+  const tasks = names.map((name) => () =>
+    setAccountDisabled(config.base_url, config.token, name, true, config.timeout)
+  );
+  return runWithConcurrency(tasks, concurrency);
+}
+
+async function runReenableBatch(
+  config: AppConfig,
+  names: string[],
+  concurrency: number
+): Promise<Array<{ name: string; ok: boolean; status_code?: number | null; error: string | null; attempts?: number; disabled?: boolean }>> {
+  const tasks = names.map((name) => () =>
+    setAccountDisabled(config.base_url, config.token, name, false, config.timeout)
+  );
+  return runWithConcurrency(tasks, concurrency);
 }
 
 async function finalizeScanSnapshot(
@@ -585,6 +624,372 @@ export async function advanceScanTask(
     recovered_count: 0,
     failure_count: 0,
   };
+}
+
+export async function advanceMaintainTask(
+  db: D1Database,
+  config: AppConfig,
+  taskId: number,
+  username?: string,
+  actionStepSize = MAINTAIN_ACTION_STEP_SIZE
+): Promise<EngineResult> {
+  const task = await getTaskById(db, taskId);
+  if (!task) {
+    return {
+      success: false,
+      total_files: 0,
+      filtered_count: 0,
+      probed_count: 0,
+      invalid_401_count: 0,
+      quota_limited_count: 0,
+      recovered_count: 0,
+      failure_count: 0,
+      error: 'task_not_found',
+    };
+  }
+
+  const params = parseTaskJson(task.params);
+  const state = parseTaskJson(task.result);
+
+  if (String(task.status || '') === 'stopping') {
+    await markTaskStopped(db, taskId, {
+      phase: String(state.phase || 'maintaining'),
+      progress: toFiniteNumber(task.progress, 0),
+      total: toFiniteNumber(task.total, 0),
+    });
+    return {
+      success: false,
+      total_files: toFiniteNumber(state.total_files, 0),
+      filtered_count: toFiniteNumber(state.filtered_count, 0),
+      probed_count: toFiniteNumber(state.probed_count, 0),
+      invalid_401_count: toFiniteNumber(state.invalid_401_count, 0),
+      quota_limited_count: toFiniteNumber(state.quota_limited_count, 0),
+      recovered_count: toFiniteNumber(state.recovered_count, 0),
+      failure_count: toFiniteNumber(state.failure_count, 0),
+      error: 'stopped',
+    };
+  }
+
+  const maintainInitialized = Number(params.maintain_initialized || 0) === 1;
+  if (!maintainInitialized) {
+    await updateTask(db, taskId, {
+      status: 'running',
+      started_at: String(task.started_at || new Date().toISOString()),
+      result: JSON.stringify({ phase: 'scanning' }),
+      params: JSON.stringify({ ...params, maintain_initialized: 1 }),
+    });
+  }
+
+  if (!state.scan_done) {
+    const scanResult = await advanceScanTask(db, config, taskId, username);
+    const latest = await getTaskById(db, taskId);
+    const latestState = parseTaskJson(latest?.result);
+
+    if (String(latest?.status || '') === 'completed') {
+      const existingState = await loadExistingState(db);
+      const candidateRecords = Array.from(existingState.values()).filter((r) =>
+        matchesFilters(r, config.target_type, config.provider)
+      );
+      const invalidRecords = candidateRecords.filter((r) => Number(r.is_invalid_401) === 1);
+      const quotaRecords = candidateRecords.filter(
+        (r) => Number(r.is_quota_limited) === 1 && Number(r.is_invalid_401) !== 1
+      );
+      const recoveredRecords = candidateRecords.filter((r) => Number(r.is_recovered) === 1);
+      const isCronRun = username === 'system';
+
+      await logActivity(
+        db,
+        'maintain_started',
+        `维护开始: 候选=${candidateRecords.length} 401=${invalidRecords.length} 限额=${quotaRecords.length} 恢复候选=${recoveredRecords.length} quota_action=${config.quota_action} delete_401=${config.delete_401 ? 1 : 0} auto_reenable=${config.auto_reenable ? 1 : 0}`,
+        username
+      );
+
+      const steps: Array<{ kind: 'delete401' | 'disableQuota' | 'deleteQuota' | 'reenable'; names: string[] }> = [];
+      if (config.delete_401 && invalidRecords.length > 0) {
+        steps.push({ kind: 'delete401', names: invalidRecords.map((r) => String(r.name)).filter(Boolean) });
+      }
+      if (config.quota_action === 'disable') {
+        const toDisable = quotaRecords.filter((r) => Number(r.disabled) !== 1).map((r) => String(r.name)).filter(Boolean);
+        if (toDisable.length > 0) steps.push({ kind: 'disableQuota', names: toDisable });
+      } else {
+        const toDelete = quotaRecords.map((r) => String(r.name)).filter(Boolean);
+        if (toDelete.length > 0) steps.push({ kind: 'deleteQuota', names: toDelete });
+      }
+      if (config.auto_reenable) {
+        const recoverable = config.reenable_scope === 'signal'
+          ? recoveredRecords
+          : recoveredRecords.filter((r) => String(r.managed_reason ?? '') === 'quota_disabled');
+        const toReenable = recoverable.map((r) => String(r.name)).filter(Boolean);
+        if (toReenable.length > 0) steps.push({ kind: 'reenable', names: toReenable });
+      }
+
+      const flatOps = steps.flatMap((step) => step.names.map((name) => ({ kind: step.kind, name })));
+      const maintainRunId = await startScanRun(db, 'maintain', config as unknown as Record<string, unknown>);
+      await updateTask(db, taskId, {
+        status: 'running',
+        total: flatOps.length,
+        progress: 0,
+        result: JSON.stringify({
+          phase: 'maintaining',
+          scan_done: true,
+          scan_summary: latestState,
+          total_files: toFiniteNumber(latestState.total_files, 0),
+          filtered_count: toFiniteNumber(latestState.filtered_count, 0),
+          probed_count: toFiniteNumber(latestState.probed_count, 0),
+          action_index: 0,
+          action_total: flatOps.length,
+          pending_operations: flatOps,
+          deleted_names: [],
+          stats: { deleted_401: 0, disabled_quota: 0, deleted_quota: 0, reenabled: 0, deleted_local: 0 },
+          maintain_run_id: maintainRunId,
+          is_cron_run: isCronRun ? 1 : 0,
+        }),
+        params: JSON.stringify({
+          ...params,
+          maintain_initialized: 1,
+          maintain_scan_done: 1,
+          maintain_run_id: maintainRunId,
+        }),
+      });
+      return scanResult;
+    }
+
+    if (String(latest?.status || '') === 'failed' || scanResult.error) {
+      await updateTask(db, taskId, {
+        status: 'failed',
+        finished_at: new Date().toISOString(),
+        error: scanResult.error || latest?.error || 'scan failed',
+      });
+    }
+    return scanResult;
+  }
+
+  const pendingOperations = Array.isArray(state.pending_operations)
+    ? state.pending_operations as Array<{ kind: 'delete401' | 'disableQuota' | 'deleteQuota' | 'reenable'; name: string }>
+    : [];
+  const actionIndex = toFiniteNumber(state.action_index, toFiniteNumber(task.progress, 0));
+  const endIndex = Math.min(actionIndex + Math.max(1, actionStepSize), pendingOperations.length);
+  const slice = pendingOperations.slice(actionIndex, endIndex);
+  const actionConcurrency = boundedConcurrency(config.action_workers, DEFAULT_ACTION_CONCURRENCY, MAX_ACTION_CONCURRENCY);
+  const existingState = await loadExistingState(db);
+  const deletedNames = new Set<string>(toStringArray(state.deleted_names));
+  const stats = {
+    deleted_401: toFiniteNumber(state.stats && (state.stats as Record<string, unknown>).deleted_401, 0),
+    disabled_quota: toFiniteNumber(state.stats && (state.stats as Record<string, unknown>).disabled_quota, 0),
+    deleted_quota: toFiniteNumber(state.stats && (state.stats as Record<string, unknown>).deleted_quota, 0),
+    reenabled: toFiniteNumber(state.stats && (state.stats as Record<string, unknown>).reenabled, 0),
+    deleted_local: toFiniteNumber(state.stats && (state.stats as Record<string, unknown>).deleted_local, 0),
+  };
+  const nowIso = new Date().toISOString();
+  const isCronRun = Number(state.is_cron_run || 0) === 1;
+
+  const grouped = new Map<string, string[]>();
+  for (const op of slice) {
+    const arr = grouped.get(op.kind) || [];
+    arr.push(op.name);
+    grouped.set(op.kind, arr);
+  }
+
+  for (const [kind, names] of grouped.entries()) {
+    if (await shouldStopTask(db, taskId)) {
+      await markTaskStopped(db, taskId, {
+        phase: 'maintaining',
+        progress: actionIndex,
+        total: pendingOperations.length,
+      });
+      return {
+        success: false,
+        total_files: toFiniteNumber(state.total_files, 0),
+        filtered_count: toFiniteNumber(state.filtered_count, 0),
+        probed_count: toFiniteNumber(state.probed_count, 0),
+        invalid_401_count: 0,
+        quota_limited_count: 0,
+        recovered_count: 0,
+        failure_count: 0,
+        error: 'stopped',
+      };
+    }
+
+    if (kind === 'delete401' || kind === 'deleteQuota') {
+      const results = await runDeleteBatch(config, names, actionConcurrency);
+      await logActionResults(
+        db,
+        kind === 'delete401' ? 'maintain_delete_401_account' : 'maintain_delete_quota_account',
+        results,
+        username,
+        { logSuccesses: !isCronRun }
+      );
+      const updates: Record<string, unknown>[] = [];
+      for (const result of results) {
+        if (result.ok) {
+          deletedNames.add(result.name);
+          if (kind === 'delete401') stats.deleted_401++; else stats.deleted_quota++;
+        }
+        const record = existingState.get(result.name);
+        if (record) {
+          record.last_action = kind === 'delete401' ? 'delete_401' : 'delete_quota';
+          record.last_action_status = result.ok ? 'success' : 'failed';
+          record.last_action_error = result.error;
+          if (result.ok) record.managed_reason = kind === 'delete401' ? 'deleted_401' : 'quota_deleted';
+          record.updated_at = nowIso;
+          updates.push(record);
+        }
+      }
+      if (updates.length > 0) await upsertAuthAccounts(db, updates);
+
+      const deletedBatchNames = results.filter((result) => result.ok).map((result) => result.name);
+      if (deletedBatchNames.length > 0) {
+        stats.deleted_local += await deleteAccountsFromDB(db, deletedBatchNames);
+        for (const name of deletedBatchNames) existingState.delete(name);
+      }
+
+      const summary = summarizeActionResults(results);
+      await logActivity(
+        db,
+        kind === 'delete401' ? 'maintain_delete_401_batch' : 'maintain_delete_quota_batch',
+        formatActionSummaryDetail(
+          kind === 'delete401' ? '删除401批次' : '删除限额批次',
+          summary,
+          [`本地删除=${deletedBatchNames.length}`]
+        ),
+        username
+      );
+    } else if (kind === 'disableQuota') {
+      const results = await runDisableBatch(config, names, actionConcurrency);
+      await logActionResults(db, 'maintain_disable_quota_account', results, username, { logSuccesses: !isCronRun });
+      const updates: Record<string, unknown>[] = [];
+      for (const result of results) {
+        if (result.ok) stats.disabled_quota++;
+        const record = existingState.get(result.name);
+        if (record) {
+          record.last_action = 'disable_quota';
+          record.last_action_status = result.ok ? 'success' : 'failed';
+          record.last_action_error = result.error;
+          if (result.ok) {
+            record.managed_reason = 'quota_disabled';
+            record.disabled = 1;
+            record.is_recovered = 0;
+          }
+          record.updated_at = nowIso;
+          updates.push(record);
+        }
+      }
+      if (updates.length > 0) await upsertAuthAccounts(db, updates);
+      const summary = summarizeActionResults(results);
+      await logActivity(db, 'maintain_disable_quota_batch', formatActionSummaryDetail('禁用限额批次', summary), username);
+    } else if (kind === 'reenable') {
+      const results = await runReenableBatch(config, names, actionConcurrency);
+      await logActionResults(db, 'maintain_reenable_account', results, username, { logSuccesses: !isCronRun });
+      const updates: Record<string, unknown>[] = [];
+      for (const result of results) {
+        if (result.ok) stats.reenabled++;
+        const record = existingState.get(result.name);
+        if (record) {
+          record.last_action = 'reenable_quota';
+          record.last_action_status = result.ok ? 'success' : 'failed';
+          record.last_action_error = result.error;
+          if (result.ok) {
+            record.managed_reason = null;
+            record.disabled = 0;
+            record.is_recovered = 0;
+            record.is_quota_limited = 0;
+            record.probe_error_kind = null;
+            record.probe_error_text = null;
+          }
+          record.updated_at = nowIso;
+          updates.push(record);
+        }
+      }
+      if (updates.length > 0) await upsertAuthAccounts(db, updates);
+      const summary = summarizeActionResults(results);
+      await logActivity(db, 'maintain_reenable_batch', formatActionSummaryDetail('恢复启用批次', summary), username);
+    }
+  }
+
+  await updateTask(db, taskId, {
+    status: 'running',
+    progress: endIndex,
+    total: pendingOperations.length,
+    result: JSON.stringify({
+      ...state,
+      phase: 'maintaining',
+      action_index: endIndex,
+      action_total: pendingOperations.length,
+      deleted_names: Array.from(deletedNames),
+      stats,
+      current_batch: `${actionIndex + 1}-${endIndex}`,
+    }),
+  });
+
+  if (endIndex < pendingOperations.length) {
+    return {
+      success: true,
+      total_files: toFiniteNumber(state.total_files, 0),
+      filtered_count: toFiniteNumber(state.filtered_count, 0),
+      probed_count: toFiniteNumber(state.probed_count, 0),
+      invalid_401_count: 0,
+      quota_limited_count: 0,
+      recovered_count: 0,
+      failure_count: 0,
+    };
+  }
+
+  const finalState = await loadExistingState(db);
+  const finalCandidates = Array.from(finalState.values()).filter((r) =>
+    matchesFilters(r, config.target_type, config.provider)
+  );
+  const finalInvalidRecords = finalCandidates.filter((r) => Number(r.is_invalid_401) === 1);
+  const finalQuotaRecords = finalCandidates.filter((r) => Number(r.is_quota_limited) === 1);
+  const finalRecoveredRecords = finalCandidates.filter((r) => Number(r.is_recovered) === 1);
+  const finalFailureRecords = finalCandidates.filter((r) => r.probe_error_kind);
+  const finalProbedFiles = finalCandidates.filter((r) => r.last_probed_at).length;
+
+  const maintainRunId = toFiniteNumber(state.maintain_run_id || params.maintain_run_id, 0);
+  if (maintainRunId > 0) {
+    await finishScanRun(db, maintainRunId, {
+      status: 'success',
+      total_files: toFiniteNumber(state.total_files, 0),
+      filtered_files: finalCandidates.length,
+      probed_files: finalProbedFiles,
+      invalid_401_count: finalInvalidRecords.length,
+      quota_limited_count: finalQuotaRecords.length,
+      recovered_count: finalRecoveredRecords.length,
+    });
+  }
+
+  const engineResult: EngineResult = {
+    success: true,
+    total_files: toFiniteNumber(state.total_files, 0),
+    filtered_count: finalCandidates.length,
+    probed_count: finalProbedFiles,
+    invalid_401_count: finalInvalidRecords.length,
+    quota_limited_count: finalQuotaRecords.length,
+    recovered_count: finalRecoveredRecords.length,
+    failure_count: finalFailureRecords.length,
+    actions: {
+      deleted_401: stats.deleted_401,
+      disabled_quota: stats.disabled_quota,
+      deleted_quota: stats.deleted_quota,
+      reenabled: stats.reenabled,
+    },
+  };
+
+  await updateTask(db, taskId, {
+    status: 'completed',
+    progress: pendingOperations.length,
+    total: pendingOperations.length,
+    finished_at: new Date().toISOString(),
+    result: JSON.stringify(engineResult),
+  });
+
+  await logActivity(
+    db,
+    'maintain',
+    `维护完成: 删除401=${stats.deleted_401} 删除本地=${stats.deleted_local} 禁用限额=${stats.disabled_quota} 删除限额=${stats.deleted_quota} 恢复=${stats.reenabled} 剩余401=${finalInvalidRecords.length} 剩余限额=${finalQuotaRecords.length}`,
+    username
+  );
+
+  return engineResult;
 }
 
 // ── scan ─────────────────────────────────────────────────────────────
