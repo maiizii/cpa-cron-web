@@ -451,7 +451,7 @@ async function pollScanTask(taskId) {
   let payload = null;
   try { payload = task.result ? JSON.parse(task.result) : null; } catch {}
   const phase = payload && payload.phase ? payload.phase : '';
-  const phaseMap = { fetching_files: '正在拉取文件列表...', probing: '正在探测账号状态...', scanning: '正在扫描中...', maintaining: '正在执行维护...' };
+  const phaseMap = { fetching_files: '正在拉取文件列表...', loading_local_state: '正在读取本地快照...', probing: '正在探测账号状态...', finalizing_snapshot: '正在回写本地快照...', scanning: '正在扫描中...', maintaining: '正在执行维护...' };
   const phaseText = phaseMap[phase] || phase || '处理中...';
   const extraLine = payload && (payload.current_item || payload.current_batch || payload.current_step)
     ? ('<div style="font-size:11px;color:var(--text-dim);margin-top:4px">'

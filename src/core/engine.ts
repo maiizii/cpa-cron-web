@@ -279,6 +279,11 @@ export async function runScan(
 
     const nowIso = new Date().toISOString();
     const files = await fetchAuthFiles(config.base_url, config.token, config.timeout);
+
+    await safeTaskUpdate(db, taskId, {
+      result: JSON.stringify({ phase: 'loading_local_state', total_files: files.length }),
+    });
+
     const existingState = await loadExistingState(db);
     const probeConcurrency = 1;
 
@@ -294,15 +299,7 @@ export async function runScan(
       inventoryByName.set(String(record.name), record);
     }
 
-    // Write inventory to DB immediately
-    await upsertAuthAccounts(db, inventoryRecords);
-
-    // Single-site cache mode: fully reconcile local cache with current remote inventory.
-    // Any local accounts not present in the current remote auth-files list are stale and must be removed.
-    const remoteNames = inventoryRecords.map((r) => String(r.name)).filter(Boolean);
-    const deletedStaleCount = await deleteAccountsNotInSet(db, remoteNames);
-
-    // Filter candidates
+    // Filter candidates first; do not let full local snapshot sync block scan progress.
     const candidateRecords = inventoryRecords.filter((r) =>
       matchesFilters(r, config.target_type, config.provider)
     );
@@ -494,19 +491,46 @@ export async function runScan(
       failure_count: failureRecords.length,
     };
 
+    await safeTaskUpdate(db, taskId, {
+      result: JSON.stringify({
+        phase: 'finalizing_snapshot',
+        total_files: files.length,
+        filtered: currentCandidates.length,
+        probed: probedFiles,
+      }),
+    });
+
+    let snapshotSyncError: string | null = null;
+    let deletedStaleCount = 0;
+    try {
+      await upsertAuthAccounts(db, inventoryRecords);
+      const remoteNames = inventoryRecords.map((r) => String(r.name)).filter(Boolean);
+      deletedStaleCount = await deleteAccountsNotInSet(db, remoteNames);
+    } catch (error) {
+      snapshotSyncError = String(error);
+    }
+
+    if (snapshotSyncError) {
+      engineResult.error = snapshotSyncError;
+    }
+
     if (finalizeTask) {
       await updateTask(db, taskId, {
         status: 'completed',
         progress: total,
         finished_at: new Date().toISOString(),
-        result: JSON.stringify(engineResult),
+        result: JSON.stringify({
+          ...engineResult,
+          snapshot_sync_error: snapshotSyncError,
+          deleted_stale_count: deletedStaleCount,
+        }),
       });
     }
 
     await logActivity(
       db,
       'scan',
-      `扫描完成: 总计=${files.length} 过滤=${currentCandidates.length} 401=${invalidRecords.length} 限额=${quotaRecords.length} 恢复=${recoveredRecords.length} 清理旧缓存=${deletedStaleCount}`,
+      `扫描完成: 总计=${files.length} 过滤=${currentCandidates.length} 401=${invalidRecords.length} 限额=${quotaRecords.length} 恢复=${recoveredRecords.length} 清理旧缓存=${deletedStaleCount}${snapshotSyncError ? ` 快照同步异常=${snapshotSyncError}` : ''}`,
       username
     );
 
