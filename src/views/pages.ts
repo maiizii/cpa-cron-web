@@ -164,7 +164,8 @@ export function accountsPage(initialData?: AccountsInitialData): string {
     </tr>`).join('')
     : '<tr><td colspan="6" style="text-align:center;color:var(--text-dim)">暂无数据</td></tr>';
   return htmlLayout('账号管理', `
-<div id="accountsAlert" style="display:none" class="alert alert-info" style="margin-bottom:16px"></div>
+<div id="accountsMetaAlert" style="display:none" class="alert alert-info" style="margin-bottom:16px"></div>
+<div id="accountsTaskAlert" style="display:none" class="alert alert-info" style="margin-bottom:16px"></div>
 <div class="table-wrapper" style="margin-bottom:16px">
   <div style="padding:14px 16px;display:flex;gap:18px;flex-wrap:wrap;align-items:center;font-size:13px;color:var(--text-dim)">
     <span id="accountsFreshness">数据来源时间: 加载中...</span>
@@ -260,24 +261,24 @@ async function refreshAccountMeta() {
 
   if (meta) {
     if (meta.cache_matches_current || meta.snapshot_ready) {
-      hideAlert();
+      hideMetaAlert();
       const freshness = meta.cache_last_success_at || meta.local_snapshot_last_updated_at;
       if (freshness) {
         document.getElementById('accountsFreshness').textContent = '数据来源时间: ' + fmtTime(freshness);
       }
     } else if (meta.current_base_url && meta.cache_base_url) {
-      showAlert(
+      showMetaAlert(
         '当前配置站点已切换，但账号列表仍是旧快照。当前站点: ' + meta.current_base_url + '；缓存站点: ' + meta.cache_base_url + '。请点击“立即扫描”刷新当前站点数据。',
         'warning'
       );
     } else if (meta.current_base_url && !meta.has_local_snapshot) {
-      showAlert('当前站点还没有任何本地快照，请点击“立即扫描”首次同步账号。', 'info');
+      showMetaAlert('当前站点还没有任何本地快照，请点击“立即扫描”首次同步账号。', 'info');
     } else if (meta.has_local_snapshot) {
-      hideAlert();
+      hideMetaAlert();
     }
 
     if (meta.cache_last_status === 'failed' && meta.cache_last_error) {
-      showAlert('最近一次扫描失败，但旧快照仍可查看。失败原因: ' + meta.cache_last_error, 'warning');
+      showMetaAlert('最近一次扫描失败，但旧快照仍可查看。失败原因: ' + meta.cache_last_error, 'warning');
     }
   }
 
@@ -341,15 +342,25 @@ async function deleteAcc(name) {
 }
 
 let scanPollTimer = null;
-function showAlert(msg, type) {
-  const el = document.getElementById('accountsAlert');
+function showMetaAlert(msg, type) {
+  const el = document.getElementById('accountsMetaAlert');
   el.className = 'alert alert-' + (type || 'info');
   el.style.display = 'block';
   el.style.marginBottom = '16px';
   el.innerHTML = msg;
 }
-function hideAlert() {
-  document.getElementById('accountsAlert').style.display = 'none';
+function hideMetaAlert() {
+  document.getElementById('accountsMetaAlert').style.display = 'none';
+}
+function showTaskAlert(msg, type) {
+  const el = document.getElementById('accountsTaskAlert');
+  el.className = 'alert alert-' + (type || 'info');
+  el.style.display = 'block';
+  el.style.marginBottom = '16px';
+  el.innerHTML = msg;
+}
+function hideTaskAlert() {
+  document.getElementById('accountsTaskAlert').style.display = 'none';
 }
 
 async function pollScanTask(taskId) {
@@ -371,7 +382,7 @@ async function pollScanTask(taskId) {
       (resultData.actions ? ' | 已删除: ' + (resultData.actions.deleted_401 || 0) : '')
     ) : '';
 
-    showAlert(
+    showTaskAlert(
       '<div style="display:flex;align-items:center;gap:12px">' +
         '<span class="material-icons" style="font-size:28px;color:var(--success)">task_alt</span>' +
         '<div style="flex:1">' +
@@ -388,11 +399,11 @@ async function pollScanTask(taskId) {
     syncPager();
     await loadAccounts();
     await refreshAccountMeta();
-    setTimeout(hideAlert, 8000);
+    setTimeout(hideTaskAlert, 8000);
     return;
   }
   if (task.status === 'failed') {
-    showAlert(
+    showTaskAlert(
       '<div style="display:flex;align-items:center;gap:12px">' +
         '<span class="material-icons" style="font-size:28px;color:var(--danger)">cancel</span>' +
         '<div style="flex:1">' +
@@ -425,7 +436,7 @@ async function pollScanTask(taskId) {
   // Update scan button to show live status
   document.getElementById('quickScanBtn').innerHTML = '<div class="spinner" style="width:14px;height:14px;border-width:2px"></div> ' + (total ? percent + '%' : phaseText);
 
-  showAlert(
+  showTaskAlert(
     '<div style="display:flex;align-items:center;gap:12px">' +
     '<div class="spinner" style="width:18px;height:18px;border-width:2px;flex-shrink:0"></div>' +
     '<div style="flex:1">' +
@@ -453,7 +464,7 @@ async function quickScan() {
   const btn = document.getElementById('quickScanBtn');
   btn.disabled = true;
   btn.innerHTML = '<div class="spinner" style="width:14px;height:14px;border-width:2px"></div> 创建任务中...';
-  showAlert(
+  showTaskAlert(
     '<div style="display:flex;align-items:center;gap:10px">' +
       '<div class="spinner" style="width:16px;height:16px;border-width:2px;flex-shrink:0"></div>' +
       '<span>正在创建扫描任务...</span>' +
@@ -463,7 +474,7 @@ async function quickScan() {
   try {
     const data = await api('/operations/scan', { method: 'POST' });
     if (!data || !data.ok || !data.task_id) {
-      showAlert(
+      showTaskAlert(
         '<div style="display:flex;align-items:center;gap:10px">' +
           '<span class="material-icons" style="color:var(--danger)">error</span>' +
           '<span>创建失败: ' + (data ? data.error || '未知错误' : '网络错误') + '</span>' +
@@ -478,7 +489,7 @@ async function quickScan() {
     if (window.showToast) window.showToast('扫描任务已创建，开始执行...', 'info', 3000);
     await pollScanTask(data.task_id);
   } catch (e) {
-    showAlert(
+    showTaskAlert(
       '<div style="display:flex;align-items:center;gap:10px">' +
         '<span class="material-icons" style="color:var(--danger)">error</span>' +
         '<span>请求失败: ' + e.message + '</span>' +

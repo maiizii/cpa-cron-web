@@ -142,6 +142,36 @@ async function logActionResults(
   }
 }
 
+async function runTasksWithProgress<T>(
+  tasks: Array<() => Promise<T>>,
+  concurrency: number,
+  onStart?: (index: number) => Promise<void> | void,
+  onFinish?: (index: number, result: T) => Promise<void> | void,
+  onError?: (index: number, error: unknown) => Promise<T> | T
+): Promise<T[]> {
+  const results: T[] = new Array(tasks.length);
+  let idx = 0;
+  const execute = async (): Promise<void> => {
+    while (true) {
+      const i = idx++;
+      if (i >= tasks.length) return;
+      if (onStart) await onStart(i);
+      try {
+        const result = await tasks[i]();
+        results[i] = result;
+        if (onFinish) await onFinish(i, result);
+      } catch (error) {
+        if (!onError) throw error;
+        const recovered = await onError(i, error);
+        results[i] = recovered;
+        if (onFinish) await onFinish(i, recovered);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => execute()));
+  return results;
+}
+
 export interface EngineResult {
   success: boolean;
   total_files: number;
@@ -241,45 +271,75 @@ export async function runScan(
         }),
       });
 
+      const itemTimeoutMs = Math.max(5000, (config.timeout + Math.max(0, config.retries) * config.timeout + 5) * 1000);
       const tasks = batch.map((record) => async () => {
         const name = String(record.name ?? '');
-        try {
-          return await withTimeout(
-            probeWhamUsage(
-              config.base_url,
-              config.token,
-              record,
-              config.timeout,
-              config.retries,
-              config.user_agent,
-              config.quota_disable_threshold
-            ),
-            Math.max(5000, (config.timeout + Math.max(0, config.retries) * config.timeout + 5) * 1000),
-            `probe ${name || 'unknown'}`
-          );
-        } catch (error) {
-          return {
-            ...record,
+        return await withTimeout(
+          probeWhamUsage(
+            config.base_url,
+            config.token,
+            record,
+            config.timeout,
+            config.retries,
+            config.user_agent,
+            config.quota_disable_threshold
+          ),
+          itemTimeoutMs,
+          `probe ${name || 'unknown'}`
+        );
+      });
+      const batchResults = await withTimeout(
+        runTasksWithProgress(
+          tasks,
+          probeConcurrency,
+          async (index) => {
+            await updateTask(db, taskId, {
+              progress: probed + index,
+              result: JSON.stringify({
+                phase: 'probing',
+                probed,
+                total_files: files.length,
+                filtered: total,
+                current_batch: batchLabel,
+                current_item: String(batch[index]?.name ?? ''),
+                current_step: 'probe_item_start',
+                current_index: probed + index + 1,
+              }),
+            });
+          },
+          async (index, result) => {
+            const now = new Date().toISOString();
+            const merged = { ...result, updated_at: now } as Record<string, unknown>;
+            const name = String(merged.name ?? batch[index]?.name ?? '');
+            const original = inventoryByName.get(name);
+            if (original) Object.assign(original, merged);
+            await upsertAuthAccounts(db, [merged]);
+            await updateTask(db, taskId, {
+              progress: probed + index + 1,
+              result: JSON.stringify({
+                phase: 'probing',
+                probed: probed + index + 1,
+                total_files: files.length,
+                filtered: total,
+                current_batch: batchLabel,
+                current_item: name,
+                current_step: 'probe_item_done',
+                current_index: probed + index + 1,
+                last_error: merged.probe_error_text ?? null,
+              }),
+            });
+          },
+          async (index, error) => ({
+            ...batch[index],
             last_probed_at: new Date().toISOString(),
             probe_error_kind: 'probe_wrapper_error',
             probe_error_text: String(error),
             updated_at: new Date().toISOString(),
-          } as Record<string, unknown>;
-        }
-      });
-      const batchResults = await withTimeout(
-        runWithConcurrency(tasks, probeConcurrency),
-        Math.max(15000, batch.length * Math.max(5000, (config.timeout + Math.max(0, config.retries) * config.timeout + 5) * 1000)),
+          } as Record<string, unknown>)
+        ),
+        Math.max(15000, batch.length * itemTimeoutMs),
         `probe batch ${batchLabel}`
       );
-
-      // Merge results back and write this batch to DB immediately
-      for (const probed_record of batchResults) {
-        const name = String(probed_record.name);
-        const original = inventoryByName.get(name);
-        if (original) Object.assign(original, probed_record, { updated_at: new Date().toISOString() });
-      }
-      await upsertAuthAccounts(db, batchResults);
 
       probed += batch.length;
       const lastItem = String(batchResults[batchResults.length - 1]?.name ?? batch[batch.length - 1]?.name ?? '');
