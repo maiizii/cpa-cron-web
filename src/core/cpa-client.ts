@@ -380,141 +380,141 @@ export async function probeWhamUsage(
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeout * 1000);
-      let resp: Response;
-      try {
-        resp = await fetch(url, {
-          method: 'POST',
-          headers: mgmtHeaders(token, true),
-          body: JSON.stringify(payload),
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-
-      result.api_http_status = resp.status;
-
-      if (resp.status === 429) {
-        result.probe_error_kind = 'management_api_http_429';
-        result.probe_error_text = 'management api-call http 429';
-        if (attempt < retries) {
-          await sleep(retryBackoff(attempt) * 1000);
-          continue;
-        }
-        return result;
-      }
-      if (resp.status >= 500) {
-        result.probe_error_kind = 'management_api_http_5xx';
-        result.probe_error_text = `management api-call http ${resp.status}`;
-        if (attempt < retries) {
-          await sleep(retryBackoff(attempt) * 1000);
-          continue;
-        }
-        return result;
-      }
-      if (resp.status >= 400) {
-        result.probe_error_kind = 'management_api_http_4xx';
-        result.probe_error_text = `management api-call http ${resp.status}`;
-        return result;
-      }
-
-      const text = await resp.text();
-      let outer: Record<string, unknown>;
-      try {
-        const parsed = JSON.parse(text);
-        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-          result.probe_error_kind = 'api_call_not_object';
-          result.probe_error_text = 'api-call response is not JSON object';
-          return result;
-        }
-        outer = parsed as Record<string, unknown>;
-      } catch {
-        result.probe_error_kind = 'api_call_invalid_json';
-        result.probe_error_text = 'api-call response is not valid JSON';
-        return result;
-      }
-
-      const statusCode = outer.status_code as number | undefined;
-      result.api_status_code = statusCode ?? null;
-      if (statusCode == null) {
-        result.probe_error_kind = 'missing_status_code';
-        result.probe_error_text = 'missing status_code in api-call response';
-        return result;
-      }
-      if (statusCode === 401) {
-        result.probe_error_kind = null;
-        result.probe_error_text = null;
-        return classifyAccountState(result, quotaDisableThreshold);
-      }
-
-      // Parse body
-      let parsedBody: Record<string, unknown> = {};
-      const body = outer.body;
-      if (typeof body === 'object' && body !== null && !Array.isArray(body)) {
-        parsedBody = body as Record<string, unknown>;
-      } else if (typeof body === 'string') {
+      const runOnce = async (): Promise<Record<string, unknown>> => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeout * 1000);
         try {
-          const p = JSON.parse(body);
-          if (typeof p === 'object' && p !== null && !Array.isArray(p)) parsedBody = p as Record<string, unknown>;
-          else {
-            result.probe_error_kind = 'body_not_object';
-            result.probe_error_text = 'api-call body is not JSON object';
+          const resp = await fetch(url, {
+            method: 'POST',
+            headers: mgmtHeaders(token, true),
+            body: JSON.stringify(payload),
+            signal: controller.signal,
+          });
+
+          result.api_http_status = resp.status;
+
+          if (resp.status === 429) {
+            result.probe_error_kind = 'management_api_http_429';
+            result.probe_error_text = 'management api-call http 429';
             return result;
           }
-        } catch {
-          result.probe_error_kind = 'body_invalid_json';
-          result.probe_error_text = 'api-call body is not valid JSON';
+          if (resp.status >= 500) {
+            result.probe_error_kind = 'management_api_http_5xx';
+            result.probe_error_text = `management api-call http ${resp.status}`;
+            return result;
+          }
+          if (resp.status >= 400) {
+            result.probe_error_kind = 'management_api_http_4xx';
+            result.probe_error_text = `management api-call http ${resp.status}`;
+            return result;
+          }
+
+          const text = await resp.text();
+          let outer: Record<string, unknown>;
+          try {
+            const parsed = JSON.parse(text);
+            if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+              result.probe_error_kind = 'api_call_not_object';
+              result.probe_error_text = 'api-call response is not JSON object';
+              return result;
+            }
+            outer = parsed as Record<string, unknown>;
+          } catch {
+            result.probe_error_kind = 'api_call_invalid_json';
+            result.probe_error_text = 'api-call response is not valid JSON';
+            return result;
+          }
+
+          const statusCode = outer.status_code as number | undefined;
+          result.api_status_code = statusCode ?? null;
+          if (statusCode == null) {
+            result.probe_error_kind = 'missing_status_code';
+            result.probe_error_text = 'missing status_code in api-call response';
+            return result;
+          }
+          if (statusCode === 401) {
+            result.probe_error_kind = null;
+            result.probe_error_text = null;
+            return classifyAccountState(result, quotaDisableThreshold);
+          }
+
+          let parsedBody: Record<string, unknown> = {};
+          const body = outer.body;
+          if (typeof body === 'object' && body !== null && !Array.isArray(body)) {
+            parsedBody = body as Record<string, unknown>;
+          } else if (typeof body === 'string') {
+            try {
+              const p = JSON.parse(body);
+              if (typeof p === 'object' && p !== null && !Array.isArray(p)) parsedBody = p as Record<string, unknown>;
+              else {
+                result.probe_error_kind = 'body_not_object';
+                result.probe_error_text = 'api-call body is not JSON object';
+                return result;
+              }
+            } catch {
+              result.probe_error_kind = 'body_invalid_json';
+              result.probe_error_text = 'api-call body is not valid JSON';
+              return result;
+            }
+          }
+
+          const rateLimit = parsedBody.rate_limit as Record<string, unknown> | null;
+          const primaryWindow = rateLimit && typeof rateLimit === 'object'
+            ? rateLimit.primary_window as Record<string, unknown> | null
+            : null;
+
+          result.usage_allowed = (rateLimit && typeof rateLimit.allowed === 'boolean')
+            ? (rateLimit.allowed ? 1 : 0) : null;
+          result.usage_limit_reached = (rateLimit && typeof rateLimit.limit_reached === 'boolean')
+            ? (rateLimit.limit_reached ? 1 : 0) : null;
+          result.usage_remaining_ratio = extractRemainingRatio(rateLimit as Record<string, unknown> | null);
+          result.usage_plan_type = (String(parsedBody.plan_type ?? '').trim()) || null;
+          result.usage_email = (String(parsedBody.email ?? '').trim()) || null;
+          result.usage_reset_at = (primaryWindow && primaryWindow.reset_at != null)
+            ? Number(primaryWindow.reset_at) : null;
+          result.usage_reset_after_seconds = (primaryWindow && primaryWindow.reset_after_seconds != null)
+            ? Number(primaryWindow.reset_after_seconds) : null;
+
+          const sparkRL = findSparkRateLimit(parsedBody);
+          const sparkPW = sparkRL && typeof sparkRL === 'object'
+            ? sparkRL.primary_window as Record<string, unknown> | null : null;
+          result.usage_spark_allowed = (sparkRL && typeof sparkRL.allowed === 'boolean')
+            ? (sparkRL.allowed ? 1 : 0) : null;
+          result.usage_spark_limit_reached = (sparkRL && typeof sparkRL.limit_reached === 'boolean')
+            ? (sparkRL.limit_reached ? 1 : 0) : null;
+          result.usage_spark_remaining_ratio = extractRemainingRatio(sparkRL);
+          result.usage_spark_reset_at = (sparkPW && sparkPW.reset_at != null)
+            ? Number(sparkPW.reset_at) : null;
+          result.usage_spark_reset_after_seconds = (sparkPW && sparkPW.reset_after_seconds != null)
+            ? Number(sparkPW.reset_after_seconds) : null;
+
+          if (statusCode === 200) {
+            result.probe_error_kind = null;
+            result.probe_error_text = null;
+            return classifyAccountState(result, quotaDisableThreshold);
+          }
+
+          result.probe_error_kind = 'other';
+          result.probe_error_text = `unexpected upstream status_code=${statusCode}`;
           return result;
+        } finally {
+          clearTimeout(timer);
         }
+      };
+
+      const guarded = await withOverallTimeout(runOnce(), timeout * 1000 + 2000, 'probe_wham_usage_total');
+      if ((guarded.probe_error_kind === 'management_api_http_429' || guarded.probe_error_kind === 'management_api_http_5xx') && attempt < retries) {
+        await sleep(retryBackoff(attempt) * 1000);
+        continue;
       }
-
-      // Extract usage data
-      const rateLimit = parsedBody.rate_limit as Record<string, unknown> | null;
-      const primaryWindow = rateLimit && typeof rateLimit === 'object'
-        ? rateLimit.primary_window as Record<string, unknown> | null
-        : null;
-
-      result.usage_allowed = (rateLimit && typeof rateLimit.allowed === 'boolean')
-        ? (rateLimit.allowed ? 1 : 0) : null;
-      result.usage_limit_reached = (rateLimit && typeof rateLimit.limit_reached === 'boolean')
-        ? (rateLimit.limit_reached ? 1 : 0) : null;
-      result.usage_remaining_ratio = extractRemainingRatio(rateLimit as Record<string, unknown> | null);
-      result.usage_plan_type = (String(parsedBody.plan_type ?? '').trim()) || null;
-      result.usage_email = (String(parsedBody.email ?? '').trim()) || null;
-      result.usage_reset_at = (primaryWindow && primaryWindow.reset_at != null)
-        ? Number(primaryWindow.reset_at) : null;
-      result.usage_reset_after_seconds = (primaryWindow && primaryWindow.reset_after_seconds != null)
-        ? Number(primaryWindow.reset_after_seconds) : null;
-
-      // Spark
-      const sparkRL = findSparkRateLimit(parsedBody);
-      const sparkPW = sparkRL && typeof sparkRL === 'object'
-        ? sparkRL.primary_window as Record<string, unknown> | null : null;
-      result.usage_spark_allowed = (sparkRL && typeof sparkRL.allowed === 'boolean')
-        ? (sparkRL.allowed ? 1 : 0) : null;
-      result.usage_spark_limit_reached = (sparkRL && typeof sparkRL.limit_reached === 'boolean')
-        ? (sparkRL.limit_reached ? 1 : 0) : null;
-      result.usage_spark_remaining_ratio = extractRemainingRatio(sparkRL);
-      result.usage_spark_reset_at = (sparkPW && sparkPW.reset_at != null)
-        ? Number(sparkPW.reset_at) : null;
-      result.usage_spark_reset_after_seconds = (sparkPW && sparkPW.reset_after_seconds != null)
-        ? Number(sparkPW.reset_after_seconds) : null;
-
-      if (statusCode === 200) {
-        result.probe_error_kind = null;
-        result.probe_error_text = null;
-        return classifyAccountState(result, quotaDisableThreshold);
-      }
-
-      result.probe_error_kind = 'other';
-      result.probe_error_text = `unexpected upstream status_code=${statusCode}`;
-      return result;
+      return guarded;
     } catch (e) {
       if (e instanceof DOMException && e.name === 'AbortError') {
         result.probe_error_kind = 'timeout';
         result.probe_error_text = 'timeout';
+      } else if (String(e).includes('probe_wham_usage_total timeout')) {
+        result.probe_error_kind = 'timeout_total';
+        result.probe_error_text = String(e);
       } else {
         result.probe_error_kind = 'other';
         result.probe_error_text = String(e);
@@ -674,6 +674,22 @@ export async function uploadAuthFile(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function withOverallTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
 }
 
 /** Run tasks with concurrency limit */
