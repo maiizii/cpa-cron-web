@@ -388,6 +388,23 @@ export async function advanceScanTask(
   let totalFiles = toFiniteNumber(resultState.total_files, 0);
   let filteredTotal = toFiniteNumber(resultState.filtered, toFiniteNumber(task.total, 0));
 
+  if (initialized && (inventoryRecords.length === 0 || currentCandidates.length === 0) && filteredTotal >= 0) {
+    const files = await fetchAuthFiles(config.base_url, config.token, config.timeout);
+    const existingState = await loadExistingState(db);
+    inventoryRecords = [];
+    for (const item of files) {
+      const r = item as Record<string, unknown>;
+      const name = String(r.name ?? r.id ?? '').trim();
+      if (!name) continue;
+      inventoryRecords.push(buildAuthRecord(r, existingState.get(name) ?? null, nowIso));
+    }
+    currentCandidates = inventoryRecords.filter((r) =>
+      matchesFilters(r, config.target_type, config.provider)
+    );
+    totalFiles = files.length;
+    filteredTotal = currentCandidates.length;
+  }
+
   if (!initialized) {
     runId = await startScanRun(db, 'scan', config as unknown as Record<string, unknown>);
     await updateTask(db, taskId, {
@@ -425,8 +442,6 @@ export async function advanceScanTask(
         total_files: totalFiles,
         filtered: filteredTotal,
         probe_index: 0,
-        inventory_records: inventoryRecords,
-        candidate_records: currentCandidates,
       }),
     });
   }
@@ -549,8 +564,6 @@ export async function advanceScanTask(
         current_item: fallbackName,
         current_step: 'probe_item_start',
         last_error: batchLastError,
-        inventory_records: inventoryRecords,
-        candidate_records: currentCandidates,
       }),
     });
 
@@ -608,8 +621,6 @@ export async function advanceScanTask(
         current_item: name,
         current_step: 'probe_item_done',
         last_error: batchLastError,
-        inventory_records: inventoryRecords,
-        candidate_records: currentCandidates,
       }),
     });
   }
@@ -732,7 +743,6 @@ export async function advanceMaintainTask(
         result: JSON.stringify({
           phase: 'maintaining',
           scan_done: true,
-          scan_summary: latestState,
           total_files: toFiniteNumber(latestState.total_files, 0),
           filtered_count: toFiniteNumber(latestState.filtered_count, 0),
           probed_count: toFiniteNumber(latestState.probed_count, 0),
