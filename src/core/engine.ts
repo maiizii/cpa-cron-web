@@ -205,12 +205,13 @@ async function safeBatchAccountUpsert(
   rows: Record<string, unknown>[],
   timeoutMs = 12000
 ): Promise<{ ok: boolean; error?: string }> {
-  try {
-    await withTimeout(upsertAuthAccounts(db, rows), timeoutMs, `upsertAuthAccounts batch size=${rows.length}`);
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, error: String(error) };
+  for (const row of rows) {
+    const result = await safeAccountUpsert(db, row, timeoutMs);
+    if (!result.ok) {
+      return { ok: false, error: result.error };
+    }
   }
+  return { ok: true };
 }
 
 async function shouldStopTask(db: D1Database, taskId: number): Promise<boolean> {
@@ -371,6 +372,21 @@ export async function runScan(
         const record = batch[index];
         const fallbackName = String(record?.name ?? '');
 
+        await safeTaskUpdate(db, taskId, {
+          progress: probed + index,
+          result: JSON.stringify({
+            phase: 'probing',
+            probed: probed + index,
+            total_files: files.length,
+            filtered: total,
+            current_batch: batchLabel,
+            current_index: probed + index + 1,
+            current_item: fallbackName,
+            current_step: 'probe_item_start',
+            last_error: batchLastError,
+          }),
+        });
+
         let merged: Record<string, unknown>;
         try {
           const result = await probeWhamUsage(
@@ -394,22 +410,33 @@ export async function runScan(
           } as Record<string, unknown>;
         }
 
+        const upsertSingle = await safeAccountUpsert(db, merged, itemTimeoutMs);
+        if (!upsertSingle.ok) {
+          merged.probe_error_kind = 'db_write_timeout';
+          merged.probe_error_text = upsertSingle.error ?? 'auth_accounts single write failed';
+          batchLastError = upsertSingle.error ?? 'auth_accounts single write failed';
+        }
+
         const name = String(merged.name ?? fallbackName);
         const original = inventoryByName.get(name);
         if (original) Object.assign(original, merged);
         batchResults.push(merged);
         batchLastError = (merged.probe_error_text as string | null | undefined) ?? batchLastError;
-      }
 
-      const upsertResult = await safeBatchAccountUpsert(db, batchResults);
-      if (!upsertResult.ok) {
-        for (const merged of batchResults) {
-          merged.probe_error_kind = 'db_write_timeout';
-          merged.probe_error_text = upsertResult.error ?? 'auth_accounts batch write failed';
-          const original = inventoryByName.get(String(merged.name ?? ''));
-          if (original) Object.assign(original, merged);
-        }
-        batchLastError = upsertResult.error ?? 'auth_accounts batch write failed';
+        await safeTaskUpdate(db, taskId, {
+          progress: probed + index + 1,
+          result: JSON.stringify({
+            phase: 'probing',
+            probed: probed + index + 1,
+            total_files: files.length,
+            filtered: total,
+            current_batch: batchLabel,
+            current_index: probed + index + 1,
+            current_item: name,
+            current_step: 'probe_item_done',
+            last_error: batchLastError,
+          }),
+        });
       }
 
       probed += batch.length;

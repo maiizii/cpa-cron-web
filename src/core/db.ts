@@ -23,25 +23,17 @@ export async function upsertAuthAccounts(
 ): Promise<void> {
   if (rows.length === 0) return;
 
-  // D1 batch limit: process in chunks of 50
-  const CHUNK = 50;
-  for (let i = 0; i < rows.length; i += CHUNK) {
-    const chunk = rows.slice(i, i + CHUNK);
-    const stmts = chunk.map((row) => {
-      const cols = AUTH_ACCOUNT_COLUMNS;
-      const placeholders = cols.map(() => '?').join(', ');
-      const updates = cols
-        .filter((c) => c !== 'name')
-        .map((c) => `${c} = excluded.${c}`)
-        .join(', ');
-      const values = cols.map((c) => row[c] ?? null);
-      return db
-        .prepare(
-          `INSERT INTO auth_accounts (${cols.join(', ')}) VALUES (${placeholders}) ON CONFLICT(name) DO UPDATE SET ${updates}`
-        )
-        .bind(...values);
-    });
-    await db.batch(stmts);
+  const cols = AUTH_ACCOUNT_COLUMNS;
+  const placeholders = cols.map(() => '?').join(', ');
+  const updates = cols
+    .filter((c) => c !== 'name')
+    .map((c) => `${c} = excluded.${c}`)
+    .join(', ');
+  const sql = `INSERT INTO auth_accounts (${cols.join(', ')}) VALUES (${placeholders}) ON CONFLICT(name) DO UPDATE SET ${updates}`;
+
+  for (const row of rows) {
+    const values = cols.map((c) => row[c] ?? null);
+    await db.prepare(sql).bind(...values).run();
   }
 }
 
