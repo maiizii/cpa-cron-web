@@ -683,101 +683,73 @@ export async function advanceMaintainTask(
 
   const maintainInitialized = Number(params.maintain_initialized || 0) === 1;
   if (!maintainInitialized) {
+    const existingState = await loadExistingState(db);
+    const candidateRecords = Array.from(existingState.values()).filter((r) =>
+      matchesFilters(r, config.target_type, config.provider)
+    );
+    const invalidRecords = candidateRecords.filter((r) => Number(r.is_invalid_401) === 1);
+    const quotaRecords = candidateRecords.filter(
+      (r) => Number(r.is_quota_limited) === 1 && Number(r.is_invalid_401) !== 1
+    );
+    const recoveredRecords = candidateRecords.filter((r) => Number(r.is_recovered) === 1);
+    const isCronRun = username === 'system';
+
+    await logActivity(
+      db,
+      'maintain_started',
+      `维护开始: 候选=${candidateRecords.length} 401=${invalidRecords.length} 限额=${quotaRecords.length} 恢复候选=${recoveredRecords.length} quota_action=${config.quota_action} delete_401=${config.delete_401 ? 1 : 0} auto_reenable=${config.auto_reenable ? 1 : 0}`,
+      username
+    );
+
+    const steps: Array<{ kind: 'delete401' | 'disableQuota' | 'deleteQuota' | 'reenable'; names: string[] }> = [];
+    if (config.delete_401 && invalidRecords.length > 0) {
+      steps.push({ kind: 'delete401', names: invalidRecords.map((r) => String(r.name)).filter(Boolean) });
+    }
+    if (config.quota_action === 'disable') {
+      const toDisable = quotaRecords.filter((r) => Number(r.disabled) !== 1).map((r) => String(r.name)).filter(Boolean);
+      if (toDisable.length > 0) steps.push({ kind: 'disableQuota', names: toDisable });
+    } else {
+      const toDelete = quotaRecords.map((r) => String(r.name)).filter(Boolean);
+      if (toDelete.length > 0) steps.push({ kind: 'deleteQuota', names: toDelete });
+    }
+    if (config.auto_reenable) {
+      const recoverable = config.reenable_scope === 'signal'
+        ? recoveredRecords
+        : recoveredRecords.filter((r) => String(r.managed_reason ?? '') === 'quota_disabled');
+      const toReenable = recoverable.map((r) => String(r.name)).filter(Boolean);
+      if (toReenable.length > 0) steps.push({ kind: 'reenable', names: toReenable });
+    }
+
+    const flatOps = steps.flatMap((step) => step.names.map((name) => ({ kind: step.kind, name })));
     await updateTask(db, taskId, {
       status: 'running',
       started_at: String(task.started_at || new Date().toISOString()),
-      result: JSON.stringify({ phase: 'scanning' }),
+      total: flatOps.length,
+      progress: 0,
+      result: JSON.stringify({
+        phase: 'maintaining',
+        scan_done: true,
+        total_files: candidateRecords.length,
+        filtered_count: candidateRecords.length,
+        probed_count: candidateRecords.filter((r) => r.last_probed_at).length,
+        action_index: 0,
+        action_total: flatOps.length,
+        pending_operations: flatOps,
+        deleted_names: [],
+        stats: { deleted_401: 0, disabled_quota: 0, deleted_quota: 0, reenabled: 0, deleted_local: 0 },
+        is_cron_run: isCronRun ? 1 : 0,
+      }),
       params: JSON.stringify({ ...params, maintain_initialized: 1 }),
     });
   }
 
-  if (!state.scan_done) {
-    const scanResult = await advanceScanTask(db, config, taskId, username);
-    const latest = await getTaskById(db, taskId);
-    const latestState = parseTaskJson(latest?.result);
+  const latestTask = maintainInitialized ? task : await getTaskById(db, taskId);
+  const latestState = parseTaskJson(latestTask?.result);
 
-    if (String(latest?.status || '') === 'completed') {
-      const existingState = await loadExistingState(db);
-      const candidateRecords = Array.from(existingState.values()).filter((r) =>
-        matchesFilters(r, config.target_type, config.provider)
-      );
-      const invalidRecords = candidateRecords.filter((r) => Number(r.is_invalid_401) === 1);
-      const quotaRecords = candidateRecords.filter(
-        (r) => Number(r.is_quota_limited) === 1 && Number(r.is_invalid_401) !== 1
-      );
-      const recoveredRecords = candidateRecords.filter((r) => Number(r.is_recovered) === 1);
-      const isCronRun = username === 'system';
-
-      await logActivity(
-        db,
-        'maintain_started',
-        `维护开始: 候选=${candidateRecords.length} 401=${invalidRecords.length} 限额=${quotaRecords.length} 恢复候选=${recoveredRecords.length} quota_action=${config.quota_action} delete_401=${config.delete_401 ? 1 : 0} auto_reenable=${config.auto_reenable ? 1 : 0}`,
-        username
-      );
-
-      const steps: Array<{ kind: 'delete401' | 'disableQuota' | 'deleteQuota' | 'reenable'; names: string[] }> = [];
-      if (config.delete_401 && invalidRecords.length > 0) {
-        steps.push({ kind: 'delete401', names: invalidRecords.map((r) => String(r.name)).filter(Boolean) });
-      }
-      if (config.quota_action === 'disable') {
-        const toDisable = quotaRecords.filter((r) => Number(r.disabled) !== 1).map((r) => String(r.name)).filter(Boolean);
-        if (toDisable.length > 0) steps.push({ kind: 'disableQuota', names: toDisable });
-      } else {
-        const toDelete = quotaRecords.map((r) => String(r.name)).filter(Boolean);
-        if (toDelete.length > 0) steps.push({ kind: 'deleteQuota', names: toDelete });
-      }
-      if (config.auto_reenable) {
-        const recoverable = config.reenable_scope === 'signal'
-          ? recoveredRecords
-          : recoveredRecords.filter((r) => String(r.managed_reason ?? '') === 'quota_disabled');
-        const toReenable = recoverable.map((r) => String(r.name)).filter(Boolean);
-        if (toReenable.length > 0) steps.push({ kind: 'reenable', names: toReenable });
-      }
-
-      const flatOps = steps.flatMap((step) => step.names.map((name) => ({ kind: step.kind, name })));
-      const maintainRunId = await startScanRun(db, 'maintain', config as unknown as Record<string, unknown>);
-      await updateTask(db, taskId, {
-        status: 'running',
-        total: flatOps.length,
-        progress: 0,
-        result: JSON.stringify({
-          phase: 'maintaining',
-          scan_done: true,
-          total_files: toFiniteNumber(latestState.total_files, 0),
-          filtered_count: toFiniteNumber(latestState.filtered_count, 0),
-          probed_count: toFiniteNumber(latestState.probed_count, 0),
-          action_index: 0,
-          action_total: flatOps.length,
-          pending_operations: flatOps,
-          deleted_names: [],
-          stats: { deleted_401: 0, disabled_quota: 0, deleted_quota: 0, reenabled: 0, deleted_local: 0 },
-          maintain_run_id: maintainRunId,
-          is_cron_run: isCronRun ? 1 : 0,
-        }),
-        params: JSON.stringify({
-          ...params,
-          maintain_initialized: 1,
-          maintain_scan_done: 1,
-          maintain_run_id: maintainRunId,
-        }),
-      });
-      return scanResult;
-    }
-
-    if (String(latest?.status || '') === 'failed' || scanResult.error) {
-      await updateTask(db, taskId, {
-        status: 'failed',
-        finished_at: new Date().toISOString(),
-        error: scanResult.error || latest?.error || 'scan failed',
-      });
-    }
-    return scanResult;
-  }
-
-  const pendingOperations = Array.isArray(state.pending_operations)
-    ? state.pending_operations as Array<{ kind: 'delete401' | 'disableQuota' | 'deleteQuota' | 'reenable'; name: string }>
+  const pendingOperations = Array.isArray(latestState.pending_operations)
+    ? latestState.pending_operations as Array<{ kind: 'delete401' | 'disableQuota' | 'deleteQuota' | 'reenable'; name: string }>
     : [];
-  const actionIndex = toFiniteNumber(state.action_index, toFiniteNumber(task.progress, 0));
+  const actionIndex = toFiniteNumber(latestState.action_index, toFiniteNumber(latestTask?.progress, 0));
   const endIndex = Math.min(actionIndex + Math.max(1, actionStepSize), pendingOperations.length);
   const slice = pendingOperations.slice(actionIndex, endIndex);
   const actionConcurrency = boundedConcurrency(config.action_workers, DEFAULT_ACTION_CONCURRENCY, MAX_ACTION_CONCURRENCY);
