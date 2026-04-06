@@ -18,6 +18,7 @@ import {
   getTaskById,
   createTask,
   updateTask,
+  getAuthAccountsMeta,
 } from '../core/db';
 import { runScan, runMaintain, runUpload } from '../core/engine';
 import type { UploadFileItem } from '../core/engine';
@@ -158,14 +159,25 @@ api.get('/accounts', async (c) => {
 
 api.get('/accounts/meta', async (c) => {
   const config = await loadConfig(c.env.DB, c.env);
-  const cache = await loadCacheMeta(c.env.DB);
+  const [cache, authMeta] = await Promise.all([
+    loadCacheMeta(c.env.DB),
+    getAuthAccountsMeta(c.env.DB),
+  ]);
+  const normalizedCurrent = (config.base_url || '').replace(/\/+$/, '');
+  const normalizedCache = (cache.cache_base_url || '').replace(/\/+$/, '');
+  const hasLocalSnapshot = authMeta.total > 0;
+  const cacheMatchesCurrent = !!normalizedCurrent && !!normalizedCache && normalizedCurrent === normalizedCache;
   return c.json({
     current_base_url: config.base_url,
     cache_base_url: cache.cache_base_url,
     cache_last_success_at: cache.cache_last_success_at,
     cache_last_status: cache.cache_last_status,
     cache_last_error: cache.cache_last_error,
-    cache_matches_current: !!config.base_url && !!cache.cache_base_url && config.base_url === cache.cache_base_url,
+    cache_matches_current: cacheMatchesCurrent,
+    has_local_snapshot: hasLocalSnapshot,
+    local_snapshot_count: authMeta.total,
+    local_snapshot_last_updated_at: authMeta.last_updated_at,
+    snapshot_ready: hasLocalSnapshot && (!!cacheMatchesCurrent || !normalizedCurrent || !normalizedCache),
   });
 });
 

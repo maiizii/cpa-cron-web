@@ -259,18 +259,21 @@ async function refreshAccountMeta() {
   }
 
   if (meta) {
-    if (meta.cache_matches_current) {
+    if (meta.cache_matches_current || meta.snapshot_ready) {
       hideAlert();
-      if (meta.cache_last_success_at) {
-        document.getElementById('accountsFreshness').textContent = '数据来源时间: ' + fmtTime(meta.cache_last_success_at);
+      const freshness = meta.cache_last_success_at || meta.local_snapshot_last_updated_at;
+      if (freshness) {
+        document.getElementById('accountsFreshness').textContent = '数据来源时间: ' + fmtTime(freshness);
       }
     } else if (meta.current_base_url && meta.cache_base_url) {
       showAlert(
         '当前配置站点已切换，但账号列表仍是旧快照。当前站点: ' + meta.current_base_url + '；缓存站点: ' + meta.cache_base_url + '。请点击“立即扫描”刷新当前站点数据。',
         'warning'
       );
-    } else if (meta.current_base_url && !meta.cache_base_url) {
+    } else if (meta.current_base_url && !meta.has_local_snapshot) {
       showAlert('当前站点还没有任何本地快照，请点击“立即扫描”首次同步账号。', 'info');
+    } else if (meta.has_local_snapshot) {
+      hideAlert();
     }
 
     if (meta.cache_last_status === 'failed' && meta.cache_last_error) {
@@ -411,6 +414,13 @@ async function pollScanTask(taskId) {
   const phase = payload && payload.phase ? payload.phase : '';
   const phaseMap = { fetching_files: '正在拉取文件列表...', probing: '正在探测账号状态...', scanning: '正在扫描中...', maintaining: '正在执行维护...' };
   const phaseText = phaseMap[phase] || phase || '处理中...';
+  const extraLine = payload && (payload.current_item || payload.current_batch || payload.current_step)
+    ? ('<div style="font-size:11px;color:var(--text-dim);margin-top:4px">'
+      + (payload.current_batch ? ('批次: ' + payload.current_batch + ' ') : '')
+      + (payload.current_item ? ('账号: ' + payload.current_item + ' ') : '')
+      + (payload.current_step ? ('步骤: ' + payload.current_step) : '')
+      + '</div>')
+    : '';
 
   // Update scan button to show live status
   document.getElementById('quickScanBtn').innerHTML = '<div class="spinner" style="width:14px;height:14px;border-width:2px"></div> ' + (total ? percent + '%' : phaseText);
@@ -427,6 +437,7 @@ async function pollScanTask(taskId) {
         '<div class="progress-bar-animated" style="width:' + percent + '%;height:100%;background:linear-gradient(90deg,var(--primary),var(--info));transition:width .3s;border-radius:4px"></div>' +
       '</div>' +
       (total ? '<div style="font-size:11px;color:var(--text-dim);margin-top:4px">已完成 ' + percent + '%</div>' : '') +
+      extraLine +
     '</div></div>',
     'info'
   );

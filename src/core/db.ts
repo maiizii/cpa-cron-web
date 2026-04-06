@@ -377,6 +377,19 @@ export async function getActivityLog(
   return { rows: result.results as Record<string, unknown>[], total };
 }
 
+export async function getAuthAccountsMeta(
+  db: D1Database
+): Promise<{ total: number; last_updated_at: string }> {
+  const [countRow, latestRow] = await Promise.all([
+    db.prepare('SELECT COUNT(*) as cnt FROM auth_accounts').first<{ cnt: number }>(),
+    db.prepare("SELECT COALESCE(MAX(updated_at), MAX(last_probed_at), MAX(last_seen_at), '') as ts FROM auth_accounts").first<{ ts: string }>(),
+  ]);
+  return {
+    total: countRow?.cnt ?? 0,
+    last_updated_at: String(latestRow?.ts ?? ''),
+  };
+}
+
 export async function getTaskById(db: D1Database, id: number): Promise<Record<string, unknown> | null> {
   return (await db.prepare('SELECT * FROM task_queue WHERE id = ?').bind(id).first()) as Record<string, unknown> | null;
 }

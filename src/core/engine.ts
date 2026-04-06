@@ -57,6 +57,22 @@ function boundedConcurrency(value: number, fallback: number, max: number): numbe
   return Math.min(Math.max(1, Math.floor(value)), max);
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
 function summarizeActionResults(results: Array<{ name: string; ok: boolean; error: string | null }>): {
   total: number;
   success: number;
@@ -211,18 +227,51 @@ export async function runScan(
     const batches = chunks(candidateRecords, PROBE_BATCH_SIZE);
 
     for (const batch of batches) {
-      const tasks = batch.map((record) => () =>
-        probeWhamUsage(
-          config.base_url,
-          config.token,
-          record,
-          config.timeout,
-          config.retries,
-          config.user_agent,
-          config.quota_disable_threshold
-        )
+      const batchLabel = `${probed + 1}-${Math.min(probed + batch.length, total)}`;
+      await updateTask(db, taskId, {
+        progress: probed,
+        result: JSON.stringify({
+          phase: 'probing',
+          probed,
+          total_files: files.length,
+          filtered: total,
+          current_batch: batchLabel,
+          current_item: String(batch[0]?.name ?? ''),
+          current_step: 'probe_batch_start',
+        }),
+      });
+
+      const tasks = batch.map((record) => async () => {
+        const name = String(record.name ?? '');
+        try {
+          return await withTimeout(
+            probeWhamUsage(
+              config.base_url,
+              config.token,
+              record,
+              config.timeout,
+              config.retries,
+              config.user_agent,
+              config.quota_disable_threshold
+            ),
+            Math.max(5000, (config.timeout + Math.max(0, config.retries) * config.timeout + 5) * 1000),
+            `probe ${name || 'unknown'}`
+          );
+        } catch (error) {
+          return {
+            ...record,
+            last_probed_at: new Date().toISOString(),
+            probe_error_kind: 'probe_wrapper_error',
+            probe_error_text: String(error),
+            updated_at: new Date().toISOString(),
+          } as Record<string, unknown>;
+        }
+      });
+      const batchResults = await withTimeout(
+        runWithConcurrency(tasks, probeConcurrency),
+        Math.max(15000, batch.length * Math.max(5000, (config.timeout + Math.max(0, config.retries) * config.timeout + 5) * 1000)),
+        `probe batch ${batchLabel}`
       );
-      const batchResults = await runWithConcurrency(tasks, probeConcurrency);
 
       // Merge results back and write this batch to DB immediately
       for (const probed_record of batchResults) {
@@ -233,9 +282,18 @@ export async function runScan(
       await upsertAuthAccounts(db, batchResults);
 
       probed += batch.length;
+      const lastItem = String(batchResults[batchResults.length - 1]?.name ?? batch[batch.length - 1]?.name ?? '');
       await updateTask(db, taskId, {
         progress: probed,
-        result: JSON.stringify({ phase: 'probing', probed, total_files: files.length, filtered: total }),
+        result: JSON.stringify({
+          phase: 'probing',
+          probed,
+          total_files: files.length,
+          filtered: total,
+          current_batch: batchLabel,
+          current_item: lastItem,
+          current_step: 'probe_batch_done',
+        }),
       });
     }
 
