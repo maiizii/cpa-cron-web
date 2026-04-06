@@ -29,6 +29,8 @@ import {
   updateTask,
   deleteAccountsFromDB,
   deleteAccountsNotInSet,
+  getTaskById,
+  isTaskStopRequested,
 } from './db';
 import { saveCacheMeta } from './config';
 
@@ -211,6 +213,26 @@ async function safeBatchAccountUpsert(
   }
 }
 
+async function shouldStopTask(db: D1Database, taskId: number): Promise<boolean> {
+  try {
+    return await isTaskStopRequested(db, taskId);
+  } catch {
+    return false;
+  }
+}
+
+async function markTaskStopped(
+  db: D1Database,
+  taskId: number,
+  partial: Record<string, unknown>
+): Promise<void> {
+  await safeTaskUpdate(db, taskId, {
+    status: 'stopped',
+    finished_at: new Date().toISOString(),
+    result: JSON.stringify({ stopped: true, ...partial }),
+  });
+}
+
 export interface EngineResult {
   success: boolean;
   total_files: number;
@@ -296,6 +318,37 @@ export async function runScan(
     const batches = chunks(candidateRecords, PROBE_BATCH_SIZE);
 
     for (const batch of batches) {
+      if (await shouldStopTask(db, taskId)) {
+        await finishScanRun(db, runId, {
+          status: 'stopped',
+          total_files: files.length,
+          filtered_files: candidateRecords.length,
+          probed_files: probed,
+          invalid_401_count: 0,
+          quota_limited_count: 0,
+          recovered_count: 0,
+        });
+        if (finalizeTask) {
+          await markTaskStopped(db, taskId, {
+            phase: 'probing',
+            probed,
+            total_files: files.length,
+            filtered: total,
+          });
+        }
+        return {
+          success: false,
+          total_files: files.length,
+          filtered_count: candidateRecords.length,
+          probed_count: probed,
+          invalid_401_count: 0,
+          quota_limited_count: 0,
+          recovered_count: 0,
+          failure_count: 0,
+          error: 'stopped',
+        };
+      }
+
       const batchLabel = `${probed + 1}-${Math.min(probed + batch.length, total)}`;
       await safeTaskUpdate(db, taskId, {
         progress: probed,

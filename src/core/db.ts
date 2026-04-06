@@ -394,6 +394,11 @@ export async function getTaskById(db: D1Database, id: number): Promise<Record<st
   return (await db.prepare('SELECT * FROM task_queue WHERE id = ?').bind(id).first()) as Record<string, unknown> | null;
 }
 
+export async function isTaskStopRequested(db: D1Database, id: number): Promise<boolean> {
+  const row = await db.prepare('SELECT status FROM task_queue WHERE id = ?').bind(id).first<{ status: string }>();
+  return row?.status === 'stopping';
+}
+
 export async function createTask(
   db: D1Database,
   type: string,

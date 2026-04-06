@@ -172,6 +172,7 @@ export function accountsPage(initialData?: AccountsInitialData): string {
     <span id="accountsProbeTime">最近探测: -</span>
     <span id="accountsTaskState">当前任务: 空闲</span>
     <button class="btn btn-primary btn-sm" onclick="quickScan()" id="quickScanBtn"><span class="material-icons" style="font-size:16px">sync</span> 立即扫描</button>
+    <button class="btn btn-outline btn-sm" onclick="stopScan()" id="stopScanBtn" disabled><span class="material-icons" style="font-size:16px">stop_circle</span> 停止扫描</button>
   </div>
 </div>
 <div class="table-wrapper">
@@ -216,6 +217,7 @@ export function accountsPage(initialData?: AccountsInitialData): string {
 let currentPage = 0, pageSize = 50, sortOrder = 'desc', totalRows = ${initialTotal};
 let searchTimer;
 let accountMetaTimer = null;
+let currentActiveTaskId = null;
 
 function syncPager() {
   document.getElementById('totalCount').textContent = '共 ' + totalRows + ' 条';
@@ -250,7 +252,19 @@ async function refreshAccountMeta() {
   }
 
   if (tasks && Array.isArray(tasks) && tasks.length > 0) {
-    const active = tasks.find(t => t.status === 'running' || t.status === 'pending');
+    const active = tasks.find(t => t.status === 'running' || t.status === 'pending' || t.status === 'stopping');
+    const stopBtn = document.getElementById('stopScanBtn');
+    if (active && active.type === 'scan' && ['running', 'pending', 'stopping'].includes(active.status)) {
+      currentActiveTaskId = active.id;
+      stopBtn.disabled = active.status === 'stopping';
+      stopBtn.innerHTML = active.status === 'stopping'
+        ? '<div class="spinner" style="width:14px;height:14px;border-width:2px"></div> 停止中...'
+        : '<span class="material-icons" style="font-size:16px">stop_circle</span> 停止扫描';
+    } else {
+      currentActiveTaskId = null;
+      stopBtn.disabled = true;
+      stopBtn.innerHTML = '<span class="material-icons" style="font-size:16px">stop_circle</span> 停止扫描';
+    }
     if (active) {
       const total = Number(active.total || 0);
       const progress = Number(active.progress || 0);
@@ -267,6 +281,9 @@ async function refreshAccountMeta() {
       document.getElementById('accountsTaskState').textContent = latest ? ('当前任务: 最近 ' + latest.type + ' / ' + latest.status) : '当前任务: 空闲';
     }
   } else {
+    currentActiveTaskId = null;
+    document.getElementById('stopScanBtn').disabled = true;
+    document.getElementById('stopScanBtn').innerHTML = '<span class="material-icons" style="font-size:16px">stop_circle</span> 停止扫描';
     document.getElementById('accountsTaskState').textContent = '当前任务: 空闲';
   }
 
@@ -498,6 +515,7 @@ async function quickScan() {
       return;
     }
     if (window.showToast) window.showToast('扫描任务已创建，开始执行...', 'info', 3000);
+    document.getElementById('stopScanBtn').disabled = false;
     await pollScanTask(data.task_id);
   } catch (e) {
     showTaskAlert(
@@ -510,6 +528,43 @@ async function quickScan() {
     if (window.showToast) window.showToast('网络请求失败', 'danger');
     btn.disabled = false;
     btn.innerHTML = '<span class="material-icons" style="font-size:16px">sync</span> 立即扫描';
+    document.getElementById('stopScanBtn').disabled = true;
+  }
+}
+
+async function stopScan() {
+  if (!currentActiveTaskId) return;
+  if (!confirm('确认停止当前扫描任务？')) return;
+  const btn = document.getElementById('stopScanBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spinner" style="width:14px;height:14px;border-width:2px"></div> 停止中...';
+  try {
+    const data = await api('/tasks/' + currentActiveTaskId + '/stop', { method: 'POST' });
+    if (data?.ok) {
+      if (window.showToast) window.showToast('停止请求已发送', 'info', 2000);
+    } else {
+      showTaskAlert(
+        '<div style="display:flex;align-items:center;gap:10px">' +
+          '<span class="material-icons" style="color:var(--danger)">error</span>' +
+          '<span>停止失败: ' + (data ? data.error || '未知错误' : '网络错误') + '</span>' +
+        '</div>',
+        'danger'
+      );
+      if (window.showToast) window.showToast('停止请求失败', 'danger');
+      btn.disabled = false;
+      btn.innerHTML = '<span class="material-icons" style="font-size:16px">stop_circle</span> 停止扫描';
+    }
+  } catch (e) {
+    showTaskAlert(
+      '<div style="display:flex;align-items:center;gap:10px">' +
+        '<span class="material-icons" style="color:var(--danger)">error</span>' +
+        '<span>停止请求失败: ' + e.message + '</span>' +
+      '</div>',
+      'danger'
+    );
+    if (window.showToast) window.showToast('停止请求失败', 'danger');
+    btn.disabled = false;
+    btn.innerHTML = '<span class="material-icons" style="font-size:16px">stop_circle</span> 停止扫描';
   }
 }
 

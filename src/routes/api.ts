@@ -330,4 +330,18 @@ api.get('/tasks/:id', async (c) => {
   return c.json(task);
 });
 
+api.post('/tasks/:id/stop', async (c) => {
+  const id = parseInt(c.req.param('id'), 10);
+  const task = await getTaskById(c.env.DB, id);
+  if (!task) return c.json({ error: '任务不存在' }, 404);
+  if (!['pending', 'running', 'stopping'].includes(String(task.status || ''))) {
+    return c.json({ ok: false, error: '当前任务不可停止', status: task.status }, 400);
+  }
+  await updateTask(c.env.DB, id, {
+    status: 'stopping',
+    error: null,
+  });
+  return c.json({ ok: true, task_id: id, status: 'stopping' });
+});
+
 export default api;
