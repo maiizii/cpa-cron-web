@@ -172,6 +172,32 @@ async function runTasksWithProgress<T>(
   return results;
 }
 
+async function safeTaskUpdate(
+  db: D1Database,
+  taskId: number,
+  patch: Record<string, unknown>,
+  timeoutMs = 8000
+): Promise<void> {
+  try {
+    await withTimeout(updateTask(db, taskId, patch), timeoutMs, `updateTask ${taskId}`);
+  } catch {
+    // ignore task progress update failures; never block the scan loop
+  }
+}
+
+async function safeAccountUpsert(
+  db: D1Database,
+  row: Record<string, unknown>,
+  timeoutMs = 8000
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    await withTimeout(upsertAuthAccounts(db, [row]), timeoutMs, `upsertAuthAccounts ${String(row.name ?? '')}`);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: String(error) };
+  }
+}
+
 export interface EngineResult {
   success: boolean;
   total_files: number;
@@ -258,7 +284,7 @@ export async function runScan(
 
     for (const batch of batches) {
       const batchLabel = `${probed + 1}-${Math.min(probed + batch.length, total)}`;
-      await updateTask(db, taskId, {
+      await safeTaskUpdate(db, taskId, {
         progress: probed,
         result: JSON.stringify({
           phase: 'probing',
@@ -293,7 +319,7 @@ export async function runScan(
           tasks,
           probeConcurrency,
           async (index) => {
-            await updateTask(db, taskId, {
+            await safeTaskUpdate(db, taskId, {
               progress: probed + index,
               result: JSON.stringify({
                 phase: 'probing',
@@ -313,8 +339,13 @@ export async function runScan(
             const name = String(merged.name ?? batch[index]?.name ?? '');
             const original = inventoryByName.get(name);
             if (original) Object.assign(original, merged);
-            await upsertAuthAccounts(db, [merged]);
-            await updateTask(db, taskId, {
+            const upsertResult = await safeAccountUpsert(db, merged);
+            if (!upsertResult.ok) {
+              merged.probe_error_kind = 'db_write_timeout';
+              merged.probe_error_text = upsertResult.error ?? 'auth_accounts write failed';
+              if (original) Object.assign(original, merged);
+            }
+            await safeTaskUpdate(db, taskId, {
               progress: probed + index + 1,
               result: JSON.stringify({
                 phase: 'probing',
@@ -343,7 +374,7 @@ export async function runScan(
 
       probed += batch.length;
       const lastItem = String(batchResults[batchResults.length - 1]?.name ?? batch[batch.length - 1]?.name ?? '');
-      await updateTask(db, taskId, {
+      await safeTaskUpdate(db, taskId, {
         progress: probed,
         result: JSON.stringify({
           phase: 'probing',
