@@ -20,7 +20,7 @@ import {
   updateTask,
   getAuthAccountsMeta,
 } from '../core/db';
-import { runScan, runMaintain, runUpload } from '../core/engine';
+import { runScan, runMaintain, runUpload, advanceScanTask } from '../core/engine';
 import type { UploadFileItem } from '../core/engine';
 import { deleteAccount, setAccountDisabled } from '../core/cpa-client';
 
@@ -227,10 +227,15 @@ api.post('/operations/scan', async (c) => {
 
   const user = c.get('user') as Record<string, unknown>;
   const username = String(user?.username ?? '');
-  const taskId = await createTask(c.env.DB, 'scan', { username });
+  const taskId = await createTask(c.env.DB, 'scan', { username, mode: 'step_scan' });
 
-  // Run in background — response returns immediately
-  getCtx(c).waitUntil(runScan(c.env.DB, config, taskId, username));
+  await updateTask(c.env.DB, taskId, {
+    status: 'running',
+    started_at: new Date().toISOString(),
+    progress: 0,
+    total: 0,
+    result: JSON.stringify({ phase: 'queued' }),
+  });
 
   return c.json({ ok: true, task_id: taskId });
 });
@@ -328,6 +333,33 @@ api.get('/tasks/:id', async (c) => {
   const task = await getTaskById(c.env.DB, id);
   if (!task) return c.json({ error: '任务不存在' }, 404);
   return c.json(task);
+});
+
+api.post('/tasks/:id/advance', async (c) => {
+  const id = parseInt(c.req.param('id'), 10);
+  const task = await getTaskById(c.env.DB, id);
+  if (!task) return c.json({ error: '任务不存在' }, 404);
+  if (String(task.type || '') !== 'scan') return c.json({ error: '仅 scan 任务支持推进' }, 400);
+  if (['completed', 'failed', 'stopped'].includes(String(task.status || ''))) {
+    return c.json({ ok: true, task_id: id, status: task.status, done: true });
+  }
+
+  const config = await loadConfig(c.env.DB, c.env);
+  const errors = validateConfig(config);
+  if (errors.length > 0) {
+    await updateTask(c.env.DB, id, {
+      status: 'failed',
+      finished_at: new Date().toISOString(),
+      error: errors.join('; '),
+    });
+    return c.json({ ok: false, error: '配置验证失败', details: errors }, 400);
+  }
+
+  const params = task.params ? JSON.parse(String(task.params)) : {};
+  const username = String((params && params.username) || '');
+  const result = await advanceScanTask(c.env.DB, config, id, username);
+  const latest = await getTaskById(c.env.DB, id);
+  return c.json({ ok: true, task_id: id, status: latest?.status || task.status, result, task: latest });
 });
 
 api.post('/tasks/:id/stop', async (c) => {

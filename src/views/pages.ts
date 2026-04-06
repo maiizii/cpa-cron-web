@@ -393,6 +393,8 @@ function hideTaskAlert() {
 
 async function pollScanTask(taskId) {
   if (scanPollTimer) clearTimeout(scanPollTimer);
+
+  await api('/tasks/' + taskId + '/advance', { method: 'POST' });
   const task = await api('/tasks/' + taskId);
   if (!task) return;
 

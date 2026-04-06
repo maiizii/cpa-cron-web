@@ -45,6 +45,7 @@ const DEFAULT_UPLOAD_CONCURRENCY = 5;
 const MAX_PROBE_CONCURRENCY = 12;
 const MAX_ACTION_CONCURRENCY = 10;
 const MAX_UPLOAD_CONCURRENCY = 8;
+const SCAN_STEP_SIZE = 8;
 
 // ── helpers ──────────────────────────────────────────────────────────
 
@@ -234,6 +235,39 @@ async function markTaskStopped(
   });
 }
 
+function parseTaskJson(value: unknown): Record<string, unknown> {
+  if (!value) return {};
+  if (typeof value === 'object' && value !== null) return value as Record<string, unknown>;
+  if (typeof value !== 'string') return {};
+  try {
+    const parsed = JSON.parse(value);
+    return typeof parsed === 'object' && parsed !== null ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function toFiniteNumber(value: unknown, fallback: number): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+async function finalizeScanSnapshot(
+  db: D1Database,
+  inventoryRecords: Record<string, unknown>[]
+): Promise<{ deletedStaleCount: number; snapshotSyncError: string | null }> {
+  let snapshotSyncError: string | null = null;
+  let deletedStaleCount = 0;
+  try {
+    await upsertAuthAccounts(db, inventoryRecords);
+    const remoteNames = inventoryRecords.map((r) => String(r.name)).filter(Boolean);
+    deletedStaleCount = await deleteAccountsNotInSet(db, remoteNames);
+  } catch (error) {
+    snapshotSyncError = String(error);
+  }
+  return { deletedStaleCount, snapshotSyncError };
+}
+
 export interface EngineResult {
   success: boolean;
   total_files: number;
@@ -255,6 +289,302 @@ export interface EngineResult {
     failed: number;
   };
   error?: string;
+}
+
+export async function advanceScanTask(
+  db: D1Database,
+  config: AppConfig,
+  taskId: number,
+  username?: string,
+  stepSize = SCAN_STEP_SIZE
+): Promise<EngineResult> {
+  const task = await getTaskById(db, taskId);
+  if (!task) {
+    return {
+      success: false,
+      total_files: 0,
+      filtered_count: 0,
+      probed_count: 0,
+      invalid_401_count: 0,
+      quota_limited_count: 0,
+      recovered_count: 0,
+      failure_count: 0,
+      error: 'task_not_found',
+    };
+  }
+
+  const params = parseTaskJson(task.params);
+  const resultState = parseTaskJson(task.result);
+  const nowIso = new Date().toISOString();
+
+  if (String(task.status || '') === 'stopping') {
+    await markTaskStopped(db, taskId, {
+      phase: String(resultState.phase || 'probing'),
+      probed: toFiniteNumber(task.progress, 0),
+      total_files: toFiniteNumber(resultState.total_files, 0),
+      filtered: toFiniteNumber(task.total, 0),
+    });
+    return {
+      success: false,
+      total_files: toFiniteNumber(resultState.total_files, 0),
+      filtered_count: toFiniteNumber(task.total, 0),
+      probed_count: toFiniteNumber(task.progress, 0),
+      invalid_401_count: 0,
+      quota_limited_count: 0,
+      recovered_count: 0,
+      failure_count: 0,
+      error: 'stopped',
+    };
+  }
+
+  let inventoryRecords = Array.isArray(resultState.inventory_records)
+    ? resultState.inventory_records as Record<string, unknown>[]
+    : [];
+  let currentCandidates = Array.isArray(resultState.candidate_records)
+    ? resultState.candidate_records as Record<string, unknown>[]
+    : [];
+  let runId = toFiniteNumber(params.scan_run_id, 0);
+  let initialized = Number(params.scan_initialized || 0) === 1;
+  let probeIndex = toFiniteNumber(resultState.probe_index, toFiniteNumber(task.progress, 0));
+  let totalFiles = toFiniteNumber(resultState.total_files, 0);
+  let filteredTotal = toFiniteNumber(resultState.filtered, toFiniteNumber(task.total, 0));
+
+  if (!initialized) {
+    runId = await startScanRun(db, 'scan', config as unknown as Record<string, unknown>);
+    await updateTask(db, taskId, {
+      status: 'running',
+      started_at: String(task.started_at || nowIso),
+      result: JSON.stringify({ phase: 'fetching_files' }),
+      params: JSON.stringify({ ...params, scan_initialized: 1, scan_run_id: runId }),
+    });
+
+    const files = await fetchAuthFiles(config.base_url, config.token, config.timeout);
+    await safeTaskUpdate(db, taskId, {
+      result: JSON.stringify({ phase: 'loading_local_state', total_files: files.length }),
+    });
+
+    const existingState = await loadExistingState(db);
+    inventoryRecords = [];
+    for (const item of files) {
+      const r = item as Record<string, unknown>;
+      const name = String(r.name ?? r.id ?? '').trim();
+      if (!name) continue;
+      inventoryRecords.push(buildAuthRecord(r, existingState.get(name) ?? null, nowIso));
+    }
+    currentCandidates = inventoryRecords.filter((r) =>
+      matchesFilters(r, config.target_type, config.provider)
+    );
+    totalFiles = files.length;
+    filteredTotal = currentCandidates.length;
+    probeIndex = 0;
+
+    await updateTask(db, taskId, {
+      total: filteredTotal,
+      progress: 0,
+      result: JSON.stringify({
+        phase: 'probing',
+        total_files: totalFiles,
+        filtered: filteredTotal,
+        probe_index: 0,
+        inventory_records: inventoryRecords,
+        candidate_records: currentCandidates,
+      }),
+    });
+  }
+
+  if (probeIndex >= currentCandidates.length) {
+    await safeTaskUpdate(db, taskId, {
+      result: JSON.stringify({
+        phase: 'finalizing_snapshot',
+        total_files: totalFiles,
+        filtered: filteredTotal,
+        probed: probeIndex,
+        probe_index: probeIndex,
+      }),
+    });
+
+    const invalidRecords = currentCandidates.filter((r) => r.is_invalid_401 === 1);
+    const quotaRecords = currentCandidates.filter((r) => r.is_quota_limited === 1);
+    const recoveredRecords = currentCandidates.filter((r) => r.is_recovered === 1);
+    const failureRecords = currentCandidates.filter((r) => !!r.probe_error_kind);
+    const { deletedStaleCount, snapshotSyncError } = await finalizeScanSnapshot(db, inventoryRecords);
+
+    const engineResult: EngineResult = {
+      success: true,
+      total_files: totalFiles,
+      filtered_count: filteredTotal,
+      probed_count: probeIndex,
+      invalid_401_count: invalidRecords.length,
+      quota_limited_count: quotaRecords.length,
+      recovered_count: recoveredRecords.length,
+      failure_count: failureRecords.length,
+    };
+    if (snapshotSyncError) engineResult.error = snapshotSyncError;
+
+    await finishScanRun(db, runId, {
+      status: 'success',
+      total_files: totalFiles,
+      filtered_files: filteredTotal,
+      probed_files: probeIndex,
+      invalid_401_count: invalidRecords.length,
+      quota_limited_count: quotaRecords.length,
+      recovered_count: recoveredRecords.length,
+    });
+    await saveCacheMeta(db, {
+      cache_base_url: config.base_url,
+      cache_last_success_at: new Date().toISOString(),
+      cache_last_status: snapshotSyncError ? 'partial' : 'success',
+      cache_last_error: snapshotSyncError ?? '',
+    });
+    await updateTask(db, taskId, {
+      status: 'completed',
+      progress: filteredTotal,
+      finished_at: new Date().toISOString(),
+      result: JSON.stringify({
+        ...engineResult,
+        snapshot_sync_error: snapshotSyncError,
+        deleted_stale_count: deletedStaleCount,
+      }),
+      params: JSON.stringify({ ...params, scan_initialized: 1, scan_run_id: runId, scan_finished: 1 }),
+    });
+    await logActivity(
+      db,
+      'scan',
+      `扫描完成: 总计=${totalFiles} 过滤=${filteredTotal} 401=${invalidRecords.length} 限额=${quotaRecords.length} 恢复=${recoveredRecords.length} 清理旧缓存=${deletedStaleCount}${snapshotSyncError ? ` 快照同步异常=${snapshotSyncError}` : ''}`,
+      username
+    );
+    return engineResult;
+  }
+
+  const endIndex = Math.min(probeIndex + Math.max(1, stepSize), currentCandidates.length);
+  const batch = currentCandidates.slice(probeIndex, endIndex);
+  const itemTimeoutMs = 12000;
+  let batchLastError: string | null = null;
+  const inventoryByName = new Map<string, Record<string, unknown>>();
+  for (const row of inventoryRecords) inventoryByName.set(String(row.name), row);
+
+  for (let index = 0; index < batch.length; index++) {
+    if (await shouldStopTask(db, taskId)) {
+      await finishScanRun(db, runId, {
+        status: 'stopped',
+        total_files: totalFiles,
+        filtered_files: filteredTotal,
+        probed_files: probeIndex + index,
+        invalid_401_count: 0,
+        quota_limited_count: 0,
+        recovered_count: 0,
+      });
+      await markTaskStopped(db, taskId, {
+        phase: 'probing',
+        probed: probeIndex + index,
+        total_files: totalFiles,
+        filtered: filteredTotal,
+      });
+      return {
+        success: false,
+        total_files: totalFiles,
+        filtered_count: filteredTotal,
+        probed_count: probeIndex + index,
+        invalid_401_count: 0,
+        quota_limited_count: 0,
+        recovered_count: 0,
+        failure_count: 0,
+        error: 'stopped',
+      };
+    }
+
+    const absoluteIndex = probeIndex + index;
+    const record = batch[index];
+    const fallbackName = String(record?.name ?? '');
+
+    await safeTaskUpdate(db, taskId, {
+      progress: absoluteIndex,
+      result: JSON.stringify({
+        phase: 'probing',
+        probed: absoluteIndex,
+        total_files: totalFiles,
+        filtered: filteredTotal,
+        probe_index: absoluteIndex,
+        current_batch: `${probeIndex + 1}-${endIndex}`,
+        current_index: absoluteIndex + 1,
+        current_item: fallbackName,
+        current_step: 'probe_item_start',
+        last_error: batchLastError,
+        inventory_records: inventoryRecords,
+        candidate_records: currentCandidates,
+      }),
+    });
+
+    let merged: Record<string, unknown>;
+    try {
+      const result = await withTimeout(
+        probeWhamUsage(
+          config.base_url,
+          config.token,
+          record,
+          config.timeout,
+          config.retries,
+          config.user_agent,
+          config.quota_disable_threshold,
+          itemTimeoutMs
+        ),
+        itemTimeoutMs + 2000,
+        `probeWhamUsage ${fallbackName}`
+      );
+      merged = { ...result, updated_at: new Date().toISOString() } as Record<string, unknown>;
+    } catch (error) {
+      const errText = String(error);
+      merged = {
+        ...record,
+        last_probed_at: new Date().toISOString(),
+        probe_error_kind: errText.includes('timeout after') ? 'probe_outer_timeout' : 'probe_wrapper_error',
+        probe_error_text: errText,
+        updated_at: new Date().toISOString(),
+      } as Record<string, unknown>;
+    }
+
+    const upsertSingle = await safeAccountUpsert(db, merged, itemTimeoutMs);
+    if (!upsertSingle.ok) {
+      merged.probe_error_kind = 'db_write_timeout';
+      merged.probe_error_text = upsertSingle.error ?? 'auth_accounts single write failed';
+      batchLastError = upsertSingle.error ?? 'auth_accounts single write failed';
+    }
+
+    const name = String(merged.name ?? fallbackName);
+    const inventoryRow = inventoryByName.get(name);
+    if (inventoryRow) Object.assign(inventoryRow, merged);
+    currentCandidates[absoluteIndex] = merged;
+    batchLastError = (merged.probe_error_text as string | null | undefined) ?? batchLastError;
+
+    await safeTaskUpdate(db, taskId, {
+      progress: absoluteIndex + 1,
+      result: JSON.stringify({
+        phase: 'probing',
+        probed: absoluteIndex + 1,
+        total_files: totalFiles,
+        filtered: filteredTotal,
+        probe_index: absoluteIndex + 1,
+        current_batch: `${probeIndex + 1}-${endIndex}`,
+        current_index: absoluteIndex + 1,
+        current_item: name,
+        current_step: 'probe_item_done',
+        last_error: batchLastError,
+        inventory_records: inventoryRecords,
+        candidate_records: currentCandidates,
+      }),
+    });
+  }
+
+  return {
+    success: true,
+    total_files: totalFiles,
+    filtered_count: filteredTotal,
+    probed_count: endIndex,
+    invalid_401_count: 0,
+    quota_limited_count: 0,
+    recovered_count: 0,
+    failure_count: 0,
+  };
 }
 
 // ── scan ─────────────────────────────────────────────────────────────
