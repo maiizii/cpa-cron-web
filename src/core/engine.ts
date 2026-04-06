@@ -218,7 +218,7 @@ export async function runScan(
     const nowIso = new Date().toISOString();
     const files = await fetchAuthFiles(config.base_url, config.token, config.timeout);
     const existingState = await loadExistingState(db);
-    const probeConcurrency = boundedConcurrency(config.probe_workers, DEFAULT_PROBE_CONCURRENCY, MAX_PROBE_CONCURRENCY);
+    const probeConcurrency = 1;
 
     const inventoryRecords: Record<string, unknown>[] = [];
     for (const item of files) {

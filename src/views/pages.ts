@@ -229,7 +229,12 @@ function fmtTime(value) {
 }
 
 async function refreshAccountMeta() {
-  const [dash, tasks, meta] = await Promise.all([api('/dashboard'), api('/tasks'), api('/accounts/meta')]);
+  const [dash, tasks, meta, accountsSummary] = await Promise.all([
+    api('/dashboard'),
+    api('/tasks'),
+    api('/accounts/meta'),
+    api('/accounts?limit=1')
+  ]);
   if (dash) {
     const lastScan = dash.last_scan;
     const freshness = lastScan ? (lastScan.finished_at || lastScan.started_at || '-') : '-';
@@ -250,7 +255,13 @@ async function refreshAccountMeta() {
       const total = Number(active.total || 0);
       const progress = Number(active.progress || 0);
       const percent = total > 0 ? Math.min(100, Math.round(progress / total * 100)) : 0;
-      document.getElementById('accountsTaskState').textContent = '当前任务: ' + active.type + ' / ' + active.status + (total ? (' / ' + progress + '/' + total + ' (' + percent + '%)') : '');
+      const localTotal = Number(accountsSummary && accountsSummary.total || 0);
+      let extra = '';
+      if (active.type === 'scan' && total > 0) {
+        extra = ' / 本地库 ' + localTotal + ' 条';
+        if (localTotal !== total) extra += '（与本轮扫描 ' + total + ' 条口径不同）';
+      }
+      document.getElementById('accountsTaskState').textContent = '当前任务: ' + active.type + ' / ' + active.status + (total ? (' / ' + progress + '/' + total + ' (' + percent + '%)') : '') + extra;
     } else {
       const latest = tasks[0];
       document.getElementById('accountsTaskState').textContent = latest ? ('当前任务: 最近 ' + latest.type + ' / ' + latest.status) : '当前任务: 空闲';
