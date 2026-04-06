@@ -366,6 +366,39 @@ export async function runScan(
       let batchLastError: string | null = null;
 
       for (let index = 0; index < batch.length; index++) {
+        if (await shouldStopTask(db, taskId)) {
+          await finishScanRun(db, runId, {
+            status: 'stopped',
+            total_files: files.length,
+            filtered_files: candidateRecords.length,
+            probed_files: probed + index,
+            invalid_401_count: 0,
+            quota_limited_count: 0,
+            recovered_count: 0,
+          });
+          if (finalizeTask) {
+            await markTaskStopped(db, taskId, {
+              phase: 'probing',
+              probed: probed + index,
+              total_files: files.length,
+              filtered: total,
+              current_batch: batchLabel,
+              current_index: probed + index + 1,
+            });
+          }
+          return {
+            success: false,
+            total_files: files.length,
+            filtered_count: candidateRecords.length,
+            probed_count: probed + index,
+            invalid_401_count: 0,
+            quota_limited_count: 0,
+            recovered_count: 0,
+            failure_count: 0,
+            error: 'stopped',
+          };
+        }
+
         const record = batch[index];
         const fallbackName = String(record?.name ?? '');
 
@@ -386,23 +419,28 @@ export async function runScan(
 
         let merged: Record<string, unknown>;
         try {
-          const result = await probeWhamUsage(
-            config.base_url,
-            config.token,
-            record,
-            config.timeout,
-            config.retries,
-            config.user_agent,
-            config.quota_disable_threshold,
-            itemTimeoutMs
+          const result = await withTimeout(
+            probeWhamUsage(
+              config.base_url,
+              config.token,
+              record,
+              config.timeout,
+              config.retries,
+              config.user_agent,
+              config.quota_disable_threshold,
+              itemTimeoutMs
+            ),
+            itemTimeoutMs + 2000,
+            `probeWhamUsage ${fallbackName}`
           );
           merged = { ...result, updated_at: new Date().toISOString() } as Record<string, unknown>;
         } catch (error) {
+          const errText = String(error);
           merged = {
             ...record,
             last_probed_at: new Date().toISOString(),
-            probe_error_kind: 'probe_wrapper_error',
-            probe_error_text: String(error),
+            probe_error_kind: errText.includes('timeout after') ? 'probe_outer_timeout' : 'probe_wrapper_error',
+            probe_error_text: errText,
             updated_at: new Date().toISOString(),
           } as Record<string, unknown>;
         }
