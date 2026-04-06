@@ -297,7 +297,7 @@ export async function runScan(
         }),
       });
 
-      const itemTimeoutMs = Math.max(5000, (config.timeout + Math.max(0, config.retries) * config.timeout + 5) * 1000);
+      const itemTimeoutMs = 12000;
 
       for (let index = 0; index < batch.length; index++) {
         const record = batch[index];
@@ -320,18 +320,15 @@ export async function runScan(
 
         let merged: Record<string, unknown>;
         try {
-          const result = await withTimeout(
-            probeWhamUsage(
-              config.base_url,
-              config.token,
-              record,
-              config.timeout,
-              config.retries,
-              config.user_agent,
-              config.quota_disable_threshold
-            ),
-            itemTimeoutMs,
-            `probe ${fallbackName || 'unknown'}`
+          const result = await probeWhamUsage(
+            config.base_url,
+            config.token,
+            record,
+            config.timeout,
+            config.retries,
+            config.user_agent,
+            config.quota_disable_threshold,
+            itemTimeoutMs
           );
           merged = { ...result, updated_at: new Date().toISOString() } as Record<string, unknown>;
         } catch (error) {
