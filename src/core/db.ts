@@ -236,6 +236,30 @@ export async function deleteAccountsFromDB(
   return deleted;
 }
 
+export async function getAccountsByNames(
+  db: D1Database,
+  names: string[]
+): Promise<Map<string, Record<string, unknown>>> {
+  const map = new Map<string, Record<string, unknown>>();
+  if (names.length === 0) return map;
+
+  const CHUNK = 100;
+  for (let i = 0; i < names.length; i += CHUNK) {
+    const chunk = names.slice(i, i + CHUNK);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const result = await db
+      .prepare(`SELECT * FROM auth_accounts WHERE name IN (${placeholders})`)
+      .bind(...chunk)
+      .all();
+    for (const row of result.results) {
+      const r = row as Record<string, unknown>;
+      map.set(String(r.name), r);
+    }
+  }
+
+  return map;
+}
+
 export async function deleteAccountsNotInSet(
   db: D1Database,
   keepNames: string[]

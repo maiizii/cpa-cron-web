@@ -29,6 +29,7 @@ import {
   updateTask,
   deleteAccountsFromDB,
   deleteAccountsNotInSet,
+  getAccountsByNames,
   getTaskById,
   isTaskStopRequested,
 } from './db';
@@ -753,7 +754,8 @@ export async function advanceMaintainTask(
   const endIndex = Math.min(actionIndex + Math.max(1, actionStepSize), pendingOperations.length);
   const slice = pendingOperations.slice(actionIndex, endIndex);
   const actionConcurrency = boundedConcurrency(config.action_workers, DEFAULT_ACTION_CONCURRENCY, MAX_ACTION_CONCURRENCY);
-  const existingState = await loadExistingState(db);
+  const batchNames = Array.from(new Set(slice.map((op) => op.name).filter(Boolean)));
+  const existingState = await getAccountsByNames(db, batchNames);
   const deletedNames = new Set<string>(toStringArray(state.deleted_names));
   const stats = {
     deleted_401: toFiniteNumber(state.stats && (state.stats as Record<string, unknown>).deleted_401, 0),
