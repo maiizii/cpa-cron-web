@@ -312,27 +312,11 @@ export async function runScan(
 
       const itemTimeoutMs = 12000;
       const batchResults: Record<string, unknown>[] = [];
+      let batchLastError: string | null = null;
 
       for (let index = 0; index < batch.length; index++) {
         const record = batch[index];
-        const currentIndex = probed + index + 1;
         const fallbackName = String(record?.name ?? '');
-
-        if (index === 0 || index === batch.length - 1 || currentIndex % 5 === 0) {
-          await safeTaskUpdate(db, taskId, {
-            progress: probed + index,
-            result: JSON.stringify({
-              phase: 'probing',
-              probed,
-              total_files: files.length,
-              filtered: total,
-              current_batch: batchLabel,
-              current_item: fallbackName,
-              current_step: 'probe_item_start',
-              current_index: currentIndex,
-            }),
-          });
-        }
 
         let merged: Record<string, unknown>;
         try {
@@ -361,23 +345,7 @@ export async function runScan(
         const original = inventoryByName.get(name);
         if (original) Object.assign(original, merged);
         batchResults.push(merged);
-
-        if (index === batch.length - 1 || currentIndex % 5 === 0) {
-          await safeTaskUpdate(db, taskId, {
-            progress: currentIndex,
-            result: JSON.stringify({
-              phase: 'probing',
-              probed: currentIndex,
-              total_files: files.length,
-              filtered: total,
-              current_batch: batchLabel,
-              current_item: name,
-              current_step: 'probe_item_done',
-              current_index: currentIndex,
-              last_error: merged.probe_error_text ?? null,
-            }),
-          });
-        }
+        batchLastError = (merged.probe_error_text as string | null | undefined) ?? batchLastError;
       }
 
       const upsertResult = await safeBatchAccountUpsert(db, batchResults);
@@ -388,6 +356,7 @@ export async function runScan(
           const original = inventoryByName.get(String(merged.name ?? ''));
           if (original) Object.assign(original, merged);
         }
+        batchLastError = upsertResult.error ?? 'auth_accounts batch write failed';
       }
 
       probed += batch.length;
@@ -402,7 +371,7 @@ export async function runScan(
           current_batch: batchLabel,
           current_item: lastItem,
           current_step: 'probe_batch_done',
-          last_error: batchResults[batchResults.length - 1]?.probe_error_text ?? null,
+          last_error: batchLastError,
         }),
       });
     }
