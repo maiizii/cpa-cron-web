@@ -47,7 +47,7 @@ const MAX_PROBE_CONCURRENCY = 12;
 const MAX_ACTION_CONCURRENCY = 10;
 const MAX_UPLOAD_CONCURRENCY = 8;
 const SCAN_STEP_SIZE = 16;
-const MAINTAIN_ACTION_STEP_SIZE = 12;
+const MAINTAIN_ACTION_STEP_SIZE = 6;
 
 // ── helpers ──────────────────────────────────────────────────────────
 
@@ -55,6 +55,28 @@ function chunks<T>(arr: T[], size: number): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
+}
+
+async function upsertAuthAccountsInChunks(
+  db: D1Database,
+  rows: Record<string, unknown>[],
+  chunkSize = 5
+): Promise<void> {
+  for (const chunk of chunks(rows, Math.max(1, chunkSize))) {
+    await upsertAuthAccounts(db, chunk);
+  }
+}
+
+async function deleteAccountsFromDBInChunks(
+  db: D1Database,
+  names: string[],
+  chunkSize = 20
+): Promise<number> {
+  let deleted = 0;
+  for (const chunk of chunks(names, Math.max(1, chunkSize))) {
+    deleted += await deleteAccountsFromDB(db, chunk);
+  }
+  return deleted;
 }
 
 function boundedConcurrency(value: number, fallback: number, max: number): number {
@@ -819,11 +841,11 @@ export async function advanceMaintainTask(
           updates.push(record);
         }
       }
-      if (updates.length > 0) await upsertAuthAccounts(db, updates);
+      if (updates.length > 0) await upsertAuthAccountsInChunks(db, updates, 5);
 
       const deletedBatchNames = results.filter((result) => result.ok).map((result) => result.name);
       if (deletedBatchNames.length > 0) {
-        stats.deleted_local += await deleteAccountsFromDB(db, deletedBatchNames);
+        stats.deleted_local += await deleteAccountsFromDBInChunks(db, deletedBatchNames, 10);
         for (const name of deletedBatchNames) existingState.delete(name);
       }
 
@@ -858,7 +880,7 @@ export async function advanceMaintainTask(
           updates.push(record);
         }
       }
-      if (updates.length > 0) await upsertAuthAccounts(db, updates);
+      if (updates.length > 0) await upsertAuthAccountsInChunks(db, updates, 5);
       const summary = summarizeActionResults(results);
       await logActivity(db, 'maintain_disable_quota_batch', formatActionSummaryDetail('禁用限额批次', summary), username);
     } else if (kind === 'reenable') {
@@ -884,7 +906,7 @@ export async function advanceMaintainTask(
           updates.push(record);
         }
       }
-      if (updates.length > 0) await upsertAuthAccounts(db, updates);
+      if (updates.length > 0) await upsertAuthAccountsInChunks(db, updates, 5);
       const summary = summarizeActionResults(results);
       await logActivity(db, 'maintain_reenable_batch', formatActionSummaryDetail('恢复启用批次', summary), username);
     }
