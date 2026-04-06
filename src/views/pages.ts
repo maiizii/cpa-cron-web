@@ -769,6 +769,18 @@ function buildResultSummaryText(data) {
 
 async function pollTask(taskId) {
   if (taskPollTimer) clearTimeout(taskPollTimer);
+
+  const currentTask = await api('/tasks/' + taskId);
+  if (!currentTask) return;
+
+  if (
+    currentTask &&
+    ['scan', 'maintain'].includes(String(currentTask.type || '')) &&
+    !['completed', 'failed', 'stopped'].includes(String(currentTask.status || ''))
+  ) {
+    await api('/tasks/' + taskId + '/advance', { method: 'POST' });
+  }
+
   const task = await api('/tasks/' + taskId);
   if (!task) return;
 
