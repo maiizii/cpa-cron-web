@@ -198,6 +198,19 @@ async function safeAccountUpsert(
   }
 }
 
+async function safeBatchAccountUpsert(
+  db: D1Database,
+  rows: Record<string, unknown>[],
+  timeoutMs = 12000
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    await withTimeout(upsertAuthAccounts(db, rows), timeoutMs, `upsertAuthAccounts batch size=${rows.length}`);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: String(error) };
+  }
+}
+
 export interface EngineResult {
   success: boolean;
   total_files: number;
@@ -298,25 +311,28 @@ export async function runScan(
       });
 
       const itemTimeoutMs = 12000;
+      const batchResults: Record<string, unknown>[] = [];
 
       for (let index = 0; index < batch.length; index++) {
         const record = batch[index];
         const currentIndex = probed + index + 1;
         const fallbackName = String(record?.name ?? '');
 
-        await safeTaskUpdate(db, taskId, {
-          progress: probed + index,
-          result: JSON.stringify({
-            phase: 'probing',
-            probed,
-            total_files: files.length,
-            filtered: total,
-            current_batch: batchLabel,
-            current_item: fallbackName,
-            current_step: 'probe_item_start',
-            current_index: currentIndex,
-          }),
-        });
+        if (index === 0 || index === batch.length - 1 || currentIndex % 5 === 0) {
+          await safeTaskUpdate(db, taskId, {
+            progress: probed + index,
+            result: JSON.stringify({
+              phase: 'probing',
+              probed,
+              total_files: files.length,
+              filtered: total,
+              current_batch: batchLabel,
+              current_item: fallbackName,
+              current_step: 'probe_item_start',
+              current_index: currentIndex,
+            }),
+          });
+        }
 
         let merged: Record<string, unknown>;
         try {
@@ -344,32 +360,38 @@ export async function runScan(
         const name = String(merged.name ?? fallbackName);
         const original = inventoryByName.get(name);
         if (original) Object.assign(original, merged);
+        batchResults.push(merged);
 
-        const upsertResult = await safeAccountUpsert(db, merged);
-        if (!upsertResult.ok) {
+        if (index === batch.length - 1 || currentIndex % 5 === 0) {
+          await safeTaskUpdate(db, taskId, {
+            progress: currentIndex,
+            result: JSON.stringify({
+              phase: 'probing',
+              probed: currentIndex,
+              total_files: files.length,
+              filtered: total,
+              current_batch: batchLabel,
+              current_item: name,
+              current_step: 'probe_item_done',
+              current_index: currentIndex,
+              last_error: merged.probe_error_text ?? null,
+            }),
+          });
+        }
+      }
+
+      const upsertResult = await safeBatchAccountUpsert(db, batchResults);
+      if (!upsertResult.ok) {
+        for (const merged of batchResults) {
           merged.probe_error_kind = 'db_write_timeout';
-          merged.probe_error_text = upsertResult.error ?? 'auth_accounts write failed';
+          merged.probe_error_text = upsertResult.error ?? 'auth_accounts batch write failed';
+          const original = inventoryByName.get(String(merged.name ?? ''));
           if (original) Object.assign(original, merged);
         }
-
-        await safeTaskUpdate(db, taskId, {
-          progress: currentIndex,
-          result: JSON.stringify({
-            phase: 'probing',
-            probed: currentIndex,
-            total_files: files.length,
-            filtered: total,
-            current_batch: batchLabel,
-            current_item: name,
-            current_step: 'probe_item_done',
-            current_index: currentIndex,
-            last_error: merged.probe_error_text ?? null,
-          }),
-        });
       }
 
       probed += batch.length;
-      const lastItem = String(batch[batch.length - 1]?.name ?? '');
+      const lastItem = String(batchResults[batchResults.length - 1]?.name ?? batch[batch.length - 1]?.name ?? '');
       await safeTaskUpdate(db, taskId, {
         progress: probed,
         result: JSON.stringify({
@@ -380,6 +402,7 @@ export async function runScan(
           current_batch: batchLabel,
           current_item: lastItem,
           current_step: 'probe_batch_done',
+          last_error: batchResults[batchResults.length - 1]?.probe_error_text ?? null,
         }),
       });
     }
