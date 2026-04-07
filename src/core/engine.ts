@@ -8,6 +8,7 @@
  * CF Workers CPU-time limits even for 500+ accounts.
  */
 
+type D1Database = any;
 import type { AppConfig } from '../types';
 import {
   fetchAuthFiles,
@@ -86,14 +87,17 @@ function boundedConcurrency(value: number, fallback: number, max: number): numbe
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+    const timer = (globalThis as any).setTimeout(
+      () => reject(new Error(`${label} timeout after ${ms}ms`)),
+      ms
+    );
     promise.then(
       (value) => {
-        clearTimeout(timer);
+        (globalThis as any).clearTimeout(timer);
         resolve(value);
       },
       (error) => {
-        clearTimeout(timer);
+        (globalThis as any).clearTimeout(timer);
         reject(error);
       }
     );
@@ -581,57 +585,57 @@ export async function advanceScanTask(
   let batchLastError: string | null = null;
   const inventoryByName = new Map<string, Record<string, unknown>>();
   for (const row of inventoryRecords) inventoryByName.set(String(row.name), row);
+  const probeConcurrency = boundedConcurrency(config.probe_workers, DEFAULT_PROBE_CONCURRENCY, MAX_PROBE_CONCURRENCY);
 
-  for (let index = 0; index < batch.length; index++) {
-    if (await shouldStopTask(db, taskId)) {
-      await finishScanRun(db, runId, {
-        status: 'stopped',
-        total_files: totalFiles,
-        filtered_files: filteredTotal,
-        probed_files: probeIndex + index,
-        invalid_401_count: 0,
-        quota_limited_count: 0,
-        recovered_count: 0,
-      });
-      await markTaskStopped(db, taskId, {
-        phase: 'probing',
-        probed: probeIndex + index,
-        total_files: totalFiles,
-        filtered: filteredTotal,
-      });
-      return {
-        success: false,
-        total_files: totalFiles,
-        filtered_count: filteredTotal,
-        probed_count: probeIndex + index,
-        invalid_401_count: 0,
-        quota_limited_count: 0,
-        recovered_count: 0,
-        failure_count: 0,
-        error: 'stopped',
-      };
-    }
-
-    const absoluteIndex = probeIndex + index;
-    const record = batch[index];
-    const fallbackName = String(record?.name ?? '');
-
-    await safeTaskUpdate(db, taskId, {
-      progress: absoluteIndex,
-      result: JSON.stringify({
-        phase: 'probing',
-        probed: absoluteIndex,
-        total_files: totalFiles,
-        filtered: filteredTotal,
-        probe_index: absoluteIndex,
-        current_batch: `${probeIndex + 1}-${endIndex}`,
-        current_index: absoluteIndex + 1,
-        current_item: fallbackName,
-        current_step: 'probe_item_start',
-        last_error: batchLastError,
-      }),
+  if (await shouldStopTask(db, taskId)) {
+    await finishScanRun(db, runId, {
+      status: 'stopped',
+      total_files: totalFiles,
+      filtered_files: filteredTotal,
+      probed_files: probeIndex,
+      invalid_401_count: 0,
+      quota_limited_count: 0,
+      recovered_count: 0,
     });
+    await markTaskStopped(db, taskId, {
+      phase: 'probing',
+      probed: probeIndex,
+      total_files: totalFiles,
+      filtered: filteredTotal,
+    });
+    return {
+      success: false,
+      total_files: totalFiles,
+      filtered_count: filteredTotal,
+      probed_count: probeIndex,
+      invalid_401_count: 0,
+      quota_limited_count: 0,
+      recovered_count: 0,
+      failure_count: 0,
+      error: 'stopped',
+    };
+  }
 
+  await safeTaskUpdate(db, taskId, {
+    progress: probeIndex,
+    result: JSON.stringify({
+      phase: 'probing',
+      probed: probeIndex,
+      total_files: totalFiles,
+      filtered: filteredTotal,
+      probe_index: probeIndex,
+      current_batch: `${probeIndex + 1}-${endIndex}`,
+      current_index: probeIndex + 1,
+      current_item: String(batch[0]?.name ?? ''),
+      current_step: 'probe_batch_running',
+      concurrency: probeConcurrency,
+      last_error: batchLastError,
+    }),
+  });
+
+  const tasks = batch.map((record, index) => async () => {
+    const absoluteIndex = probeIndex + index;
+    const fallbackName = String(record?.name ?? '');
     let merged: Record<string, unknown>;
     try {
       const result = await withTimeout(
@@ -664,31 +668,38 @@ export async function advanceScanTask(
     if (!upsertSingle.ok) {
       merged.probe_error_kind = 'db_write_timeout';
       merged.probe_error_text = upsertSingle.error ?? 'auth_accounts single write failed';
-      batchLastError = upsertSingle.error ?? 'auth_accounts single write failed';
     }
 
+    return { absoluteIndex, fallbackName, merged };
+  });
+
+  const batchResults = await runWithConcurrency(tasks, probeConcurrency);
+
+  for (const item of batchResults) {
+    const { absoluteIndex, fallbackName, merged } = item;
     const name = String(merged.name ?? fallbackName);
     const inventoryRow = inventoryByName.get(name);
     if (inventoryRow) Object.assign(inventoryRow, merged);
     currentCandidates[absoluteIndex] = merged;
     batchLastError = (merged.probe_error_text as string | null | undefined) ?? batchLastError;
-
-    await safeTaskUpdate(db, taskId, {
-      progress: absoluteIndex + 1,
-      result: JSON.stringify({
-        phase: 'probing',
-        probed: absoluteIndex + 1,
-        total_files: totalFiles,
-        filtered: filteredTotal,
-        probe_index: absoluteIndex + 1,
-        current_batch: `${probeIndex + 1}-${endIndex}`,
-        current_index: absoluteIndex + 1,
-        current_item: name,
-        current_step: 'probe_item_done',
-        last_error: batchLastError,
-      }),
-    });
   }
+
+  await safeTaskUpdate(db, taskId, {
+    progress: endIndex,
+    result: JSON.stringify({
+      phase: 'probing',
+      probed: endIndex,
+      total_files: totalFiles,
+      filtered: filteredTotal,
+      probe_index: endIndex,
+      current_batch: `${probeIndex + 1}-${endIndex}`,
+      current_index: endIndex,
+      current_item: String(batchResults[batchResults.length - 1]?.merged?.name ?? batch[batch.length - 1]?.name ?? ''),
+      current_step: 'probe_batch_done',
+      concurrency: probeConcurrency,
+      last_error: batchLastError,
+    }),
+  });
 
   return {
     success: true,
