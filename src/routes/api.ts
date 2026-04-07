@@ -10,7 +10,9 @@ import {
   getDashboardStats,
   getAccounts,
   deleteAccountFromDB,
+  deleteAccountsFromDB,
   updateAccountDisabledState,
+  updateAccountsDisabledState,
   getScanRuns,
   getScanRunById,
   stopScanRunById,
@@ -184,6 +186,57 @@ api.get('/accounts/meta', async (c) => {
     local_snapshot_last_updated_at: authMeta.last_updated_at,
     snapshot_ready: hasLocalSnapshot && (!!cacheMatchesCurrent || !normalizedCurrent || !normalizedCache),
   });
+});
+
+api.post('/accounts/batch-toggle', async (c) => {
+  const body = await c.req.json<{ names: string[]; disabled: boolean }>();
+  const names = Array.isArray(body?.names) ? body.names.map((n) => String(n || '').trim()).filter(Boolean) : [];
+  if (names.length === 0) return c.json({ ok: false, error: '未提供账号' }, 400);
+  const disabled = !!body?.disabled;
+  const config = await loadConfig(c.env.DB, c.env);
+  if (!config.base_url || !config.token)
+    return c.json({ error: 'CPA 配置不完整' }, 400);
+
+  const results = [] as Array<Record<string, unknown>>;
+  const succeeded: string[] = [];
+  for (const name of names) {
+    const result = await setAccountDisabled(config.base_url, config.token, name, disabled, config.timeout);
+    results.push(result as unknown as Record<string, unknown>);
+    if (result.ok) succeeded.push(name);
+  }
+
+  if (succeeded.length > 0) {
+    await updateAccountsDisabledState(c.env.DB, succeeded, disabled);
+    const user = c.get('user') as Record<string, unknown>;
+    await logActivity(c.env.DB, 'batch_toggle_account', `${disabled ? '批量禁用' : '批量启用'}账号 ${succeeded.length} 个`, String(user?.username ?? ''));
+  }
+
+  return c.json({ ok: true, requested: names.length, succeeded: succeeded.length, failed: names.length - succeeded.length, results });
+});
+
+api.post('/accounts/batch-delete', async (c) => {
+  const body = await c.req.json<{ names: string[] }>();
+  const names = Array.isArray(body?.names) ? body.names.map((n) => String(n || '').trim()).filter(Boolean) : [];
+  if (names.length === 0) return c.json({ ok: false, error: '未提供账号' }, 400);
+  const config = await loadConfig(c.env.DB, c.env);
+  if (!config.base_url || !config.token)
+    return c.json({ error: 'CPA 配置不完整' }, 400);
+
+  const results = [] as Array<Record<string, unknown>>;
+  const succeeded: string[] = [];
+  for (const name of names) {
+    const result = await deleteAccount(config.base_url, config.token, name, config.timeout, config.delete_retries);
+    results.push(result as unknown as Record<string, unknown>);
+    if (result.ok) succeeded.push(name);
+  }
+
+  if (succeeded.length > 0) {
+    await deleteAccountsFromDB(c.env.DB, succeeded);
+    const user = c.get('user') as Record<string, unknown>;
+    await logActivity(c.env.DB, 'batch_delete_account', `批量删除账号 ${succeeded.length} 个`, String(user?.username ?? ''));
+  }
+
+  return c.json({ ok: true, requested: names.length, succeeded: succeeded.length, failed: names.length - succeeded.length, results });
 });
 
 api.delete('/accounts/:name', async (c) => {

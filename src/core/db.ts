@@ -341,6 +341,27 @@ export async function updateAccountDisabledState(
     .run();
 }
 
+export async function updateAccountsDisabledState(
+  db: D1Database,
+  names: string[],
+  disabled: boolean
+): Promise<number> {
+  if (names.length === 0) return 0;
+  const CHUNK = 200;
+  const now = new Date().toISOString();
+  let changed = 0;
+  for (let i = 0; i < names.length; i += CHUNK) {
+    const chunk = names.slice(i, i + CHUNK);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const result = await db
+      .prepare(`UPDATE auth_accounts SET disabled = ?, updated_at = ?, last_action_status = 'success' WHERE name IN (${placeholders})`)
+      .bind(disabled ? 1 : 0, now, ...chunk)
+      .run();
+    changed += Number(result.meta.changes || 0);
+  }
+  return changed;
+}
+
 export async function getDashboardStats(db: D1Database): Promise<Record<string, unknown>> {
   const stats = await db.batch([
     db.prepare('SELECT COUNT(*) as cnt FROM auth_accounts'),

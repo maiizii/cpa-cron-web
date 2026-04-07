@@ -152,6 +152,7 @@ export function accountsPage(initialData?: AccountsInitialData): string {
   const initialTbody = initialRows.length
     ? initialRows.map((r) => `
     <tr>
+      <td><input type="checkbox" class="account-check" value="${encodeURIComponent(String(r.name || ''))}" onchange="syncSelectionBar()"></td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis">${String(r.email || r.account || '-')}</td>
       <td>${String(r.provider || '-')}</td>
       <td>${Number(r.is_invalid_401 || 0) === 1 ? '<span class="badge badge-danger">401</span>' : Number(r.disabled || 0) === 1 && Number(r.is_quota_limited || 0) === 1 ? '<span class="badge badge-warning">限额已禁用</span>' : Number(r.is_quota_limited || 0) === 1 ? '<span class="badge badge-warning">限额</span>' : Number(r.disabled || 0) === 1 && Number(r.is_recovered || 0) === 1 ? '<span class="badge badge-info">可恢复</span>' : Number(r.is_recovered || 0) === 1 ? '<span class="badge badge-info">恢复</span>' : Number(r.disabled || 0) === 1 ? '<span class="badge badge-dim">禁用</span>' : r.probe_error_kind ? '<span class="badge badge-warning">异常</span>' : '<span class="badge badge-success">有效</span>'}</td>
@@ -162,7 +163,7 @@ export function accountsPage(initialData?: AccountsInitialData): string {
         <button class="btn btn-danger btn-sm" onclick="deleteAcc('${encodeURIComponent(String(r.name || ''))}')">删除</button>
       </td>
     </tr>`).join('')
-    : '<tr><td colspan="6" style="text-align:center;color:var(--text-dim)">暂无数据</td></tr>';
+    : '<tr><td colspan="7" style="text-align:center;color:var(--text-dim)">暂无数据</td></tr>';
   return htmlLayout('账号管理', `
 <div id="accountsMetaAlert" style="display:none" class="alert alert-info" style="margin-bottom:16px"></div>
 <div id="accountsTaskAlert" style="display:none" class="alert alert-info" style="margin-bottom:16px"></div>
@@ -176,7 +177,7 @@ export function accountsPage(initialData?: AccountsInitialData): string {
   </div>
 </div>
 <div class="table-wrapper">
-  <div class="table-toolbar">
+  <div class="table-toolbar" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
     <input type="text" id="searchInput" placeholder="搜索账号名/邮箱..." style="width:240px" oninput="debounceSearch()">
     <select id="statusFilter" onchange="loadAccounts()" style="width:150px">
       <option value="">全部状态</option>
@@ -186,6 +187,12 @@ export function accountsPage(initialData?: AccountsInitialData): string {
       <option value="quota_limited">配额耗尽</option>
       <option value="recovered">已恢复</option>
       <option value="probe_error">探测异常</option>
+    </select>
+    <select id="pageSizeSelect" onchange="changePageSize()" style="width:110px">
+      <option value="20">20/页</option>
+      <option value="50" selected>50/页</option>
+      <option value="100">100/页</option>
+      <option value="200">200/页</option>
     </select>
     <select id="sortSelect" onchange="loadAccounts()" style="width:140px">
       <option value="updated_at">更新时间</option>
@@ -198,10 +205,19 @@ export function accountsPage(initialData?: AccountsInitialData): string {
     </button>
     <span id="totalCount" style="font-size:13px;color:var(--text-dim);margin-left:auto">共 ${initialTotal} 条</span>
   </div>
+  <div style="padding:12px 16px;border-top:1px solid var(--border);display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-dim)">
+      <input type="checkbox" id="selectAllPage" onchange="toggleSelectAllPage()"> 本页全选
+    </label>
+    <span id="selectedCount" style="font-size:13px;color:var(--text-dim)">已选 0 项</span>
+    <button class="btn btn-outline btn-sm" id="batchDisableBtn" onclick="batchToggle(true)" disabled>批量禁用</button>
+    <button class="btn btn-primary btn-sm" id="batchEnableBtn" onclick="batchToggle(false)" disabled>批量启用</button>
+    <button class="btn btn-danger btn-sm" id="batchDeleteBtn" onclick="batchDelete()" disabled>批量删除</button>
+  </div>
   <div id="accountsTable">
     <table>
       <thead><tr>
-        <th>邮箱</th><th>Provider</th><th>状态</th><th>API</th><th>更新时间</th><th>操作</th>
+        <th style="width:42px">选</th><th>邮箱</th><th>Provider</th><th>状态</th><th>API</th><th>更新时间</th><th>操作</th>
       </tr></thead>
       <tbody id="accountsBody">${initialTbody}</tbody>
     </table>
@@ -218,6 +234,7 @@ let currentPage = 0, pageSize = 50, sortOrder = 'desc', totalRows = ${initialTot
 let searchTimer;
 let accountMetaTimer = null;
 let currentActiveTaskId = null;
+let selectedAccounts = new Set();
 
 function syncPager() {
   document.getElementById('totalCount').textContent = '共 ' + totalRows + ' 条';
@@ -321,6 +338,34 @@ function toggleOrder() {
   loadAccounts();
 }
 function changePage(dir) { currentPage = Math.max(0, currentPage + dir); loadAccounts(); }
+function changePageSize() {
+  pageSize = parseInt(document.getElementById('pageSizeSelect').value || '50', 10);
+  currentPage = 0;
+  selectedAccounts.clear();
+  loadAccounts();
+}
+function getSelectedNames() {
+  return Array.from(selectedAccounts).map(v => decodeURIComponent(v));
+}
+function syncSelectionBar() {
+  const checkboxes = Array.from(document.querySelectorAll('.account-check'));
+  const checked = checkboxes.filter(el => el.checked);
+  for (const el of checkboxes) {
+    if (el.checked) selectedAccounts.add(el.value);
+    else selectedAccounts.delete(el.value);
+  }
+  const selectAll = document.getElementById('selectAllPage');
+  if (selectAll) selectAll.checked = checkboxes.length > 0 && checked.length === checkboxes.length;
+  document.getElementById('selectedCount').textContent = '已选 ' + selectedAccounts.size + ' 项';
+  document.getElementById('batchDisableBtn').disabled = selectedAccounts.size === 0;
+  document.getElementById('batchEnableBtn').disabled = selectedAccounts.size === 0;
+  document.getElementById('batchDeleteBtn').disabled = selectedAccounts.size === 0;
+}
+function toggleSelectAllPage() {
+  const checked = document.getElementById('selectAllPage').checked;
+  document.querySelectorAll('.account-check').forEach(el => { el.checked = checked; });
+  syncSelectionBar();
+}
 function statusBadge(row) {
   if (row.is_invalid_401) return '<span class="badge badge-danger">401</span>';
   if (row.disabled && row.is_quota_limited) return '<span class="badge badge-warning">限额已禁用</span>';
@@ -341,22 +386,28 @@ async function loadAccounts() {
   syncPager();
   const tbody = document.getElementById('accountsBody');
   if (!data.rows.length) {
-    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-dim)">暂无数据</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-dim)">暂无数据</td></tr>';
+    syncSelectionBar();
     return;
   }
-  tbody.innerHTML = data.rows.map(r => \`
-    <tr>
-      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis">\${r.email||r.account||'-'}</td>
-      <td>\${r.provider||'-'}</td>
-      <td>\${statusBadge(r)}</td>
-      <td>\${r.api_status_code!=null?r.api_status_code:'-'}</td>
-      <td style="white-space:nowrap;font-size:12px">\${window.formatChinaTime(r.updated_at)}</td>
-      <td>
-        <button class="btn btn-sm \${r.disabled?'btn-primary':'btn-outline'}" onclick="toggleAccount('\${encodeURIComponent(r.name)}',\${!r.disabled})">\${r.disabled?'启用':'禁用'}</button>
-        <button class="btn btn-danger btn-sm" onclick="deleteAcc('\${encodeURIComponent(r.name)}')">删除</button>
-      </td>
-    </tr>
-  \`).join('');
+  tbody.innerHTML = data.rows.map(r => {
+    const encodedName = encodeURIComponent(r.name);
+    const checked = selectedAccounts.has(encodedName) ? 'checked' : '';
+    return ''
+      + '<tr>'
+      + '<td><input type="checkbox" class="account-check" value="' + encodedName + '" ' + checked + ' onchange="syncSelectionBar()"></td>'
+      + '<td style="max-width:180px;overflow:hidden;text-overflow:ellipsis">' + (r.email||r.account||'-') + '</td>'
+      + '<td>' + (r.provider||'-') + '</td>'
+      + '<td>' + statusBadge(r) + '</td>'
+      + '<td>' + (r.api_status_code!=null?r.api_status_code:'-') + '</td>'
+      + '<td style="white-space:nowrap;font-size:12px">' + window.formatChinaTime(r.updated_at) + '</td>'
+      + '<td>'
+      + '<button class="btn btn-sm ' + (r.disabled?'btn-primary':'btn-outline') + '" onclick="toggleAccount(\'' + encodedName + '\',' + (!r.disabled) + ')">' + (r.disabled?'启用':'禁用') + '</button>'
+      + '<button class="btn btn-danger btn-sm" onclick="deleteAcc(\'' + encodedName + '\')">删除</button>'
+      + '</td>'
+      + '</tr>';
+  }).join('');
+  syncSelectionBar();
 }
 async function toggleAccount(name, disabled) {
   if (!confirm(disabled ? '确认禁用此账号？' : '确认启用此账号？')) return;
@@ -366,7 +417,36 @@ async function toggleAccount(name, disabled) {
 async function deleteAcc(name) {
   if (!confirm('确认删除此账号？此操作不可撤销！')) return;
   await api('/accounts/' + name, { method:'DELETE' });
+  selectedAccounts.delete(name);
   loadAccounts();
+}
+
+async function batchToggle(disabled) {
+  const names = getSelectedNames();
+  if (!names.length) return;
+  if (!confirm((disabled ? '确认批量禁用 ' : '确认批量启用 ') + names.length + ' 个账号？')) return;
+  const data = await api('/accounts/batch-toggle', { method:'POST', body: JSON.stringify({ names, disabled }) });
+  if (data?.ok) {
+    if (window.showToast) window.showToast('批量操作完成：成功 ' + data.succeeded + '，失败 ' + data.failed, data.failed ? 'warning' : 'success', 4000);
+    selectedAccounts.clear();
+    loadAccounts();
+  } else {
+    if (window.showToast) window.showToast(data?.error || '批量操作失败', 'danger');
+  }
+}
+
+async function batchDelete() {
+  const names = getSelectedNames();
+  if (!names.length) return;
+  if (!confirm('确认批量删除 ' + names.length + ' 个账号？此操作不可撤销！')) return;
+  const data = await api('/accounts/batch-delete', { method:'POST', body: JSON.stringify({ names }) });
+  if (data?.ok) {
+    if (window.showToast) window.showToast('批量删除完成：成功 ' + data.succeeded + '，失败 ' + data.failed, data.failed ? 'warning' : 'success', 4000);
+    selectedAccounts.clear();
+    loadAccounts();
+  } else {
+    if (window.showToast) window.showToast(data?.error || '批量删除失败', 'danger');
+  }
 }
 
 let scanPollTimer = null;
