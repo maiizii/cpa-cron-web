@@ -650,6 +650,20 @@ async function stopScan() {
   }
 }
 
+window.debounceSearch = debounceSearch;
+window.loadAccounts = loadAccounts;
+window.toggleOrder = toggleOrder;
+window.changePage = changePage;
+window.changePageSize = changePageSize;
+window.syncSelectionBar = syncSelectionBar;
+window.toggleSelectAllPage = toggleSelectAllPage;
+window.toggleAccount = toggleAccount;
+window.deleteAcc = deleteAcc;
+window.batchToggle = batchToggle;
+window.batchDelete = batchDelete;
+window.quickScan = quickScan;
+window.stopScan = stopScan;
+
 syncPager();
 loadAccounts();
 refreshAccountMeta();
