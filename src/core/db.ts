@@ -31,9 +31,14 @@ export async function upsertAuthAccounts(
     .join(', ');
   const sql = `INSERT INTO auth_accounts (${cols.join(', ')}) VALUES (${placeholders}) ON CONFLICT(name) DO UPDATE SET ${updates}`;
 
-  for (const row of rows) {
-    const values = cols.map((c) => row[c] ?? null);
-    await db.prepare(sql).bind(...values).run();
+  const BATCH_SIZE = 50;
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const statements = chunk.map((row) => {
+      const values = cols.map((c) => row[c] ?? null);
+      return db.prepare(sql).bind(...values);
+    });
+    await db.batch(statements);
   }
 }
 
@@ -452,4 +457,22 @@ export async function getRecentTasks(
     .bind(limit)
     .all();
   return result.results as Record<string, unknown>[];
+}
+
+export async function deleteTaskById(db: D1Database, id: number): Promise<boolean> {
+  const result = await db.prepare('DELETE FROM task_queue WHERE id = ?').bind(id).run();
+  return Number(result.meta.changes || 0) > 0;
+}
+
+export async function deleteTasksByStatuses(
+  db: D1Database,
+  statuses: string[]
+): Promise<number> {
+  if (statuses.length === 0) return 0;
+  const placeholders = statuses.map(() => '?').join(', ');
+  const result = await db
+    .prepare(`DELETE FROM task_queue WHERE status IN (${placeholders})`)
+    .bind(...statuses)
+    .run();
+  return Number(result.meta.changes || 0);
 }

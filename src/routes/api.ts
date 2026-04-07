@@ -19,6 +19,8 @@ import {
   createTask,
   updateTask,
   getAuthAccountsMeta,
+  deleteTaskById,
+  deleteTasksByStatuses,
 } from '../core/db';
 import { runScan, runMaintain, runUpload, advanceScanTask, advanceMaintainTask } from '../core/engine';
 import type { UploadFileItem } from '../core/engine';
@@ -248,7 +250,7 @@ api.post('/operations/maintain', async (c) => {
 
   const user = c.get('user') as Record<string, unknown>;
   const username = String(user?.username ?? '');
-  const taskId = await createTask(c.env.DB, 'maintain', { username, mode: 'step_maintain' });
+  const taskId = await createTask(c.env.DB, 'maintain', { username, mode: 'snapshot_only' });
 
   await updateTask(c.env.DB, taskId, {
     status: 'running',
@@ -384,6 +386,22 @@ api.post('/tasks/:id/stop', async (c) => {
     error: null,
   });
   return c.json({ ok: true, task_id: id, status: 'stopping' });
+});
+
+api.delete('/tasks/:id', async (c) => {
+  const id = parseInt(c.req.param('id'), 10);
+  const task = await getTaskById(c.env.DB, id);
+  if (!task) return c.json({ error: '任务不存在' }, 404);
+  if (['running', 'pending', 'stopping'].includes(String(task.status || ''))) {
+    return c.json({ ok: false, error: '运行中的任务不可直接删除，请先停止' }, 400);
+  }
+  const ok = await deleteTaskById(c.env.DB, id);
+  return c.json({ ok, task_id: id });
+});
+
+api.post('/tasks/cleanup', async (c) => {
+  const deleted = await deleteTasksByStatuses(c.env.DB, ['completed', 'failed', 'stopped']);
+  return c.json({ ok: true, deleted });
 });
 
 export default api;

@@ -281,6 +281,48 @@ function toStringArray(value: unknown): string[] {
   return value.map((item) => String(item)).filter(Boolean);
 }
 
+function buildMaintainOperations(
+  records: Record<string, unknown>[],
+  config: AppConfig
+): {
+  invalidRecords: Record<string, unknown>[];
+  quotaRecords: Record<string, unknown>[];
+  recoveredRecords: Record<string, unknown>[];
+  flatOps: Array<{ kind: 'delete401' | 'disableQuota' | 'deleteQuota' | 'reenable'; name: string }>;
+} {
+  const invalidRecords = records.filter((r) => Number(r.is_invalid_401) === 1);
+  const quotaRecords = records.filter(
+    (r) => Number(r.is_quota_limited) === 1 && Number(r.is_invalid_401) !== 1
+  );
+  const recoveredRecords = records.filter((r) => Number(r.is_recovered) === 1);
+
+  const steps: Array<{ kind: 'delete401' | 'disableQuota' | 'deleteQuota' | 'reenable'; names: string[] }> = [];
+  if (config.delete_401 && invalidRecords.length > 0) {
+    steps.push({ kind: 'delete401', names: invalidRecords.map((r) => String(r.name)).filter(Boolean) });
+  }
+  if (config.quota_action === 'disable') {
+    const toDisable = quotaRecords.filter((r) => Number(r.disabled) !== 1).map((r) => String(r.name)).filter(Boolean);
+    if (toDisable.length > 0) steps.push({ kind: 'disableQuota', names: toDisable });
+  } else {
+    const toDelete = quotaRecords.map((r) => String(r.name)).filter(Boolean);
+    if (toDelete.length > 0) steps.push({ kind: 'deleteQuota', names: toDelete });
+  }
+  if (config.auto_reenable) {
+    const recoverable = config.reenable_scope === 'signal'
+      ? recoveredRecords
+      : recoveredRecords.filter((r) => String(r.managed_reason ?? '') === 'quota_disabled');
+    const toReenable = recoverable.map((r) => String(r.name)).filter(Boolean);
+    if (toReenable.length > 0) steps.push({ kind: 'reenable', names: toReenable });
+  }
+
+  return {
+    invalidRecords,
+    quotaRecords,
+    recoveredRecords,
+    flatOps: steps.flatMap((step) => step.names.map((name) => ({ kind: step.kind, name }))),
+  };
+}
+
 async function runDeleteBatch(
   config: AppConfig,
   names: string[],
@@ -706,178 +748,53 @@ export async function advanceMaintainTask(
 
   const maintainInitialized = Number(params.maintain_initialized || 0) === 1;
   if (!maintainInitialized) {
+    const mode = String(params.mode || 'snapshot_only');
+    const isCronRun = username === 'system';
+    let candidateRecords: Record<string, unknown>[] = [];
+    let totalFiles = 0;
+    let probedCount = 0;
+
     await updateTask(db, taskId, {
       status: 'running',
       started_at: String(task.started_at || new Date().toISOString()),
-      result: JSON.stringify({ phase: 'fetching_files' }),
+      result: JSON.stringify({ phase: mode === 'scan_then_maintain' ? 'fetching_files' : 'loading_local_state' }),
     });
 
-    const nowIso = new Date().toISOString();
-    const files = await fetchAuthFiles(config.base_url, config.token, config.timeout);
-
-    await safeTaskUpdate(db, taskId, {
-      result: JSON.stringify({ phase: 'loading_local_state', total_files: files.length }),
-    });
-
-    const fullExistingState = await loadExistingState(db);
-    const inventoryRecords: Record<string, unknown>[] = [];
-    for (const item of files) {
-      const r = item as Record<string, unknown>;
-      const name = String(r.name ?? r.id ?? '').trim();
-      if (!name) continue;
-      inventoryRecords.push(buildAuthRecord(r, fullExistingState.get(name) ?? null, nowIso));
-    }
-
-    const candidateRecords = inventoryRecords.filter((r) =>
-      matchesFilters(r, config.target_type, config.provider)
-    );
-
-    await updateTask(db, taskId, {
-      total: candidateRecords.length,
-      progress: 0,
-      result: JSON.stringify({
-        phase: 'probing',
-        total_files: files.length,
-        filtered_count: candidateRecords.length,
-        filtered: candidateRecords.length,
-        probe_index: 0,
-      }),
-    });
-
-    const probedRecords: Record<string, unknown>[] = [];
-    let batchLastError: string | null = null;
-
-    for (let index = 0; index < candidateRecords.length; index++) {
-      if (await shouldStopTask(db, taskId)) {
-        await markTaskStopped(db, taskId, {
-          phase: 'probing',
-          progress: index,
-          total: candidateRecords.length,
-          total_files: files.length,
-          filtered: candidateRecords.length,
+    if (mode === 'scan_then_maintain') {
+      const scanResult = await runScan(db, config, taskId, username, { finalizeTask: false });
+      if (!scanResult.success) {
+        await updateTask(db, taskId, {
+          status: scanResult.error === 'stopped' ? 'stopped' : 'failed',
+          finished_at: new Date().toISOString(),
+          error: scanResult.error || 'scan failed',
+          result: JSON.stringify(scanResult),
         });
-        return {
-          success: false,
-          total_files: files.length,
-          filtered_count: candidateRecords.length,
-          probed_count: index,
-          invalid_401_count: 0,
-          quota_limited_count: 0,
-          recovered_count: 0,
-          failure_count: 0,
-          error: 'stopped',
-        };
+        return scanResult;
       }
-
-      const record = candidateRecords[index];
-      const fallbackName = String(record?.name ?? '');
-
-      await safeTaskUpdate(db, taskId, {
-        progress: index,
-        result: JSON.stringify({
-          phase: 'probing',
-          total_files: files.length,
-          filtered_count: candidateRecords.length,
-          filtered: candidateRecords.length,
-          probe_index: index,
-          current_batch: `${index + 1}-${candidateRecords.length}`,
-          current_index: index + 1,
-          current_item: fallbackName,
-          current_step: 'probe_item_start',
-          last_error: batchLastError,
-        }),
-      });
-
-      let merged: Record<string, unknown>;
-      try {
-        const result = await withTimeout(
-          probeWhamUsage(
-            config.base_url,
-            config.token,
-            record,
-            config.timeout,
-            config.retries,
-            config.user_agent,
-            config.quota_disable_threshold
-          ),
-          20000,
-          `maintain probe ${fallbackName}`
-        );
-        const currentName = String(result.name ?? fallbackName);
-        const inventoryRecord = inventoryRecords.find((row) => String(row.name) === currentName) ?? record;
-        merged = { ...inventoryRecord, ...result, name: currentName, updated_at: nowIso, last_seen_at: nowIso, last_probed_at: nowIso };
-        batchLastError = merged.probe_error_text ? String(merged.probe_error_text) : null;
-      } catch (error) {
-        const errorText = String(error);
-        batchLastError = errorText;
-        merged = {
-          ...record,
-          name: fallbackName,
-          probe_error_kind: 'other',
-          probe_error_text: errorText,
-          updated_at: nowIso,
-          last_seen_at: nowIso,
-          last_probed_at: nowIso,
-        };
-      }
-
-      probedRecords.push(merged);
-
-      await safeTaskUpdate(db, taskId, {
-        progress: index + 1,
-        result: JSON.stringify({
-          phase: 'probing',
-          total_files: files.length,
-          filtered_count: candidateRecords.length,
-          filtered: candidateRecords.length,
-          probe_index: index + 1,
-          current_batch: `${index + 1}-${candidateRecords.length}`,
-          current_index: index + 1,
-          current_item: String(merged.name ?? fallbackName),
-          current_step: 'probe_item_done',
-          last_error: batchLastError,
-        }),
-      });
+      const fullExistingState = await loadExistingState(db);
+      candidateRecords = Array.from(fullExistingState.values()).filter((r) =>
+        matchesFilters(r, config.target_type, config.provider)
+      );
+      totalFiles = scanResult.total_files;
+      probedCount = scanResult.probed_count;
+    } else {
+      const fullExistingState = await loadExistingState(db);
+      candidateRecords = Array.from(fullExistingState.values()).filter((r) =>
+        matchesFilters(r, config.target_type, config.provider)
+      );
+      totalFiles = candidateRecords.length;
+      probedCount = candidateRecords.filter((r) => r.last_probed_at).length;
     }
 
-    if (probedRecords.length > 0) {
-      await upsertAuthAccountsInChunks(db, probedRecords, 5);
-    }
-
-    const invalidRecords = probedRecords.filter((r) => Number(r.is_invalid_401) === 1);
-    const quotaRecords = probedRecords.filter(
-      (r) => Number(r.is_quota_limited) === 1 && Number(r.is_invalid_401) !== 1
-    );
-    const recoveredRecords = probedRecords.filter((r) => Number(r.is_recovered) === 1);
-    const isCronRun = username === 'system';
+    const { invalidRecords, quotaRecords, recoveredRecords, flatOps } = buildMaintainOperations(candidateRecords, config);
 
     await logActivity(
       db,
-      'maintain_started',
-      `维护开始: 候选=${probedRecords.length} 401=${invalidRecords.length} 限额=${quotaRecords.length} 恢复候选=${recoveredRecords.length} quota_action=${config.quota_action} delete_401=${config.delete_401 ? 1 : 0} auto_reenable=${config.auto_reenable ? 1 : 0}`,
+      mode === 'scan_then_maintain' ? 'maintain_after_scan_started' : 'maintain_started',
+      `维护开始: 模式=${mode} 候选=${candidateRecords.length} 401=${invalidRecords.length} 限额=${quotaRecords.length} 恢复候选=${recoveredRecords.length} quota_action=${config.quota_action} delete_401=${config.delete_401 ? 1 : 0} auto_reenable=${config.auto_reenable ? 1 : 0}`,
       username
     );
 
-    const steps: Array<{ kind: 'delete401' | 'disableQuota' | 'deleteQuota' | 'reenable'; names: string[] }> = [];
-    if (config.delete_401 && invalidRecords.length > 0) {
-      steps.push({ kind: 'delete401', names: invalidRecords.map((r) => String(r.name)).filter(Boolean) });
-    }
-    if (config.quota_action === 'disable') {
-      const toDisable = quotaRecords.filter((r) => Number(r.disabled) !== 1).map((r) => String(r.name)).filter(Boolean);
-      if (toDisable.length > 0) steps.push({ kind: 'disableQuota', names: toDisable });
-    } else {
-      const toDelete = quotaRecords.map((r) => String(r.name)).filter(Boolean);
-      if (toDelete.length > 0) steps.push({ kind: 'deleteQuota', names: toDelete });
-    }
-    if (config.auto_reenable) {
-      const recoverable = config.reenable_scope === 'signal'
-        ? recoveredRecords
-        : recoveredRecords.filter((r) => String(r.managed_reason ?? '') === 'quota_disabled');
-      const toReenable = recoverable.map((r) => String(r.name)).filter(Boolean);
-      if (toReenable.length > 0) steps.push({ kind: 'reenable', names: toReenable });
-    }
-
-    const flatOps = steps.flatMap((step) => step.names.map((name) => ({ kind: step.kind, name })));
     await updateTask(db, taskId, {
       status: 'running',
       started_at: String(task.started_at || new Date().toISOString()),
@@ -885,10 +802,14 @@ export async function advanceMaintainTask(
       progress: 0,
       result: JSON.stringify({
         phase: 'maintaining',
-        scan_done: true,
-        total_files: files.length,
-        filtered_count: probedRecords.length,
-        probed_count: probedRecords.length,
+        scan_done: mode === 'scan_then_maintain',
+        source_mode: mode,
+        total_files: totalFiles,
+        filtered_count: candidateRecords.length,
+        probed_count: probedCount,
+        invalid_401_count: invalidRecords.length,
+        quota_limited_count: quotaRecords.length,
+        recovered_count: recoveredRecords.length,
         action_index: 0,
         action_total: flatOps.length,
         pending_operations: flatOps,
@@ -896,7 +817,7 @@ export async function advanceMaintainTask(
         stats: { deleted_401: 0, disabled_quota: 0, deleted_quota: 0, reenabled: 0, deleted_local: 0 },
         is_cron_run: isCronRun ? 1 : 0,
       }),
-      params: JSON.stringify({ ...params, maintain_initialized: 1 }),
+      params: JSON.stringify({ ...params, maintain_initialized: 1, mode }),
     });
   }
 
@@ -1237,62 +1158,25 @@ export async function runScan(
       });
 
       const itemTimeoutMs = 12000;
-      const batchResults: Record<string, unknown>[] = [];
       let batchLastError: string | null = null;
+      const probeConcurrency = boundedConcurrency(config.probe_workers, DEFAULT_PROBE_CONCURRENCY, MAX_PROBE_CONCURRENCY);
 
-      for (let index = 0; index < batch.length; index++) {
-        if (await shouldStopTask(db, taskId)) {
-          await finishScanRun(db, runId, {
-            status: 'stopped',
-            total_files: files.length,
-            filtered_files: candidateRecords.length,
-            probed_files: probed + index,
-            invalid_401_count: 0,
-            quota_limited_count: 0,
-            recovered_count: 0,
-          });
-          if (finalizeTask) {
-            await markTaskStopped(db, taskId, {
-              phase: 'probing',
-              probed: probed + index,
-              total_files: files.length,
-              filtered: total,
-              current_batch: batchLabel,
-              current_index: probed + index + 1,
-            });
-          }
-          return {
-            success: false,
-            total_files: files.length,
-            filtered_count: candidateRecords.length,
-            probed_count: probed + index,
-            invalid_401_count: 0,
-            quota_limited_count: 0,
-            recovered_count: 0,
-            failure_count: 0,
-            error: 'stopped',
-          };
-        }
+      await safeTaskUpdate(db, taskId, {
+        progress: probed,
+        result: JSON.stringify({
+          phase: 'probing',
+          probed,
+          total_files: files.length,
+          filtered: total,
+          current_batch: batchLabel,
+          current_item: String(batch[0]?.name ?? ''),
+          current_step: 'probe_batch_running',
+          concurrency: probeConcurrency,
+        }),
+      });
 
-        const record = batch[index];
+      const tasks = batch.map((record) => async () => {
         const fallbackName = String(record?.name ?? '');
-
-        await safeTaskUpdate(db, taskId, {
-          progress: probed + index,
-          result: JSON.stringify({
-            phase: 'probing',
-            probed: probed + index,
-            total_files: files.length,
-            filtered: total,
-            current_batch: batchLabel,
-            current_index: probed + index + 1,
-            current_item: fallbackName,
-            current_step: 'probe_item_start',
-            last_error: batchLastError,
-          }),
-        });
-
-        let merged: Record<string, unknown>;
         try {
           const result = await withTimeout(
             probeWhamUsage(
@@ -1308,10 +1192,10 @@ export async function runScan(
             itemTimeoutMs + 2000,
             `probeWhamUsage ${fallbackName}`
           );
-          merged = { ...result, updated_at: new Date().toISOString() } as Record<string, unknown>;
+          return { ...result, updated_at: new Date().toISOString() } as Record<string, unknown>;
         } catch (error) {
           const errText = String(error);
-          merged = {
+          return {
             ...record,
             last_probed_at: new Date().toISOString(),
             probe_error_kind: errText.includes('timeout after') ? 'probe_outer_timeout' : 'probe_wrapper_error',
@@ -1319,34 +1203,23 @@ export async function runScan(
             updated_at: new Date().toISOString(),
           } as Record<string, unknown>;
         }
+      });
 
-        const upsertSingle = await safeAccountUpsert(db, merged, itemTimeoutMs);
-        if (!upsertSingle.ok) {
-          merged.probe_error_kind = 'db_write_timeout';
-          merged.probe_error_text = upsertSingle.error ?? 'auth_accounts single write failed';
-          batchLastError = upsertSingle.error ?? 'auth_accounts single write failed';
+      const batchResults = await runWithConcurrency(tasks, probeConcurrency);
+      const upsertBatch = await safeBatchAccountUpsert(db, batchResults, itemTimeoutMs + 4000);
+      if (!upsertBatch.ok) {
+        batchLastError = upsertBatch.error ?? 'auth_accounts batch write failed';
+        for (const row of batchResults) {
+          row.probe_error_kind = row.probe_error_kind || 'db_write_timeout';
+          row.probe_error_text = row.probe_error_text || batchLastError;
         }
+      }
 
-        const name = String(merged.name ?? fallbackName);
+      for (const merged of batchResults) {
+        const name = String(merged.name ?? '');
         const original = inventoryByName.get(name);
         if (original) Object.assign(original, merged);
-        batchResults.push(merged);
         batchLastError = (merged.probe_error_text as string | null | undefined) ?? batchLastError;
-
-        await safeTaskUpdate(db, taskId, {
-          progress: probed + index + 1,
-          result: JSON.stringify({
-            phase: 'probing',
-            probed: probed + index + 1,
-            total_files: files.length,
-            filtered: total,
-            current_batch: batchLabel,
-            current_index: probed + index + 1,
-            current_item: name,
-            current_step: 'probe_item_done',
-            last_error: batchLastError,
-          }),
-        });
       }
 
       probed += batch.length;
