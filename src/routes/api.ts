@@ -26,10 +26,13 @@ import {
   getAuthAccountsMeta,
   deleteTaskById,
   deleteTasksByStatuses,
+  getAccountByName,
+  getAccountsByNames,
+  upsertAuthAccounts,
 } from '../core/db';
 import { runScan, runMaintain, runUpload, advanceScanTask, advanceMaintainTask } from '../core/engine';
 import type { UploadFileItem } from '../core/engine';
-import { deleteAccount, setAccountDisabled } from '../core/cpa-client';
+import { deleteAccount, setAccountDisabled, probeWhamUsage } from '../core/cpa-client';
 
 const api = new Hono<HonoEnv>();
 
@@ -268,6 +271,71 @@ api.post('/accounts/:name/toggle', async (c) => {
     await logActivity(c.env.DB, 'toggle_account', `${body.disabled ? '禁用' : '启用'}账号: ${name}`, String(user?.username ?? ''));
   }
   return c.json(result);
+});
+
+api.post('/accounts/:name/probe', async (c) => {
+  const name = decodeURIComponent(c.req.param('name'));
+  const config = await loadConfig(c.env.DB, c.env);
+  if (!config.base_url || !config.token)
+    return c.json({ ok: false, error: 'CPA 配置不完整' }, 400);
+
+  const existing = await getAccountByName(c.env.DB, name);
+  if (!existing) return c.json({ ok: false, error: '账号不存在' }, 404);
+
+  const result = await probeWhamUsage(
+    config.base_url,
+    config.token,
+    existing,
+    config.timeout,
+    config.retries,
+    config.user_agent,
+    config.quota_disable_threshold
+  );
+  const merged = { ...existing, ...result, updated_at: new Date().toISOString() } as Record<string, unknown>;
+  await upsertAuthAccounts(c.env.DB, [merged]);
+
+  const user = c.get('user') as Record<string, unknown>;
+  await logActivity(c.env.DB, 'probe_account', `检测账号: ${name} / 状态=${String(merged.api_status_code ?? '-')}`, String(user?.username ?? ''));
+  return c.json({ ok: true, row: merged });
+});
+
+api.post('/accounts/batch-probe', async (c) => {
+  const body = await c.req.json<{ names: string[] }>();
+  const names = Array.isArray(body?.names) ? body.names.map((n) => String(n || '').trim()).filter(Boolean) : [];
+  if (names.length === 0) return c.json({ ok: false, error: '未提供账号' }, 400);
+
+  const config = await loadConfig(c.env.DB, c.env);
+  if (!config.base_url || !config.token)
+    return c.json({ ok: false, error: 'CPA 配置不完整' }, 400);
+
+  const existingMap = await getAccountsByNames(c.env.DB, names);
+  const results: Array<Record<string, unknown>> = [];
+  const updatedRows: Record<string, unknown>[] = [];
+
+  for (const name of names) {
+    const existing = existingMap.get(name);
+    if (!existing) {
+      results.push({ name, ok: false, error: '账号不存在' });
+      continue;
+    }
+    const probed = await probeWhamUsage(
+      config.base_url,
+      config.token,
+      existing,
+      config.timeout,
+      config.retries,
+      config.user_agent,
+      config.quota_disable_threshold
+    );
+    const merged = { ...existing, ...probed, updated_at: new Date().toISOString() } as Record<string, unknown>;
+    await upsertAuthAccounts(c.env.DB, [merged]);
+    updatedRows.push(merged);
+    results.push({ name, ok: true, api_status_code: merged.api_status_code ?? null, status: merged.is_invalid_401 ? '401' : merged.is_quota_limited ? 'quota' : merged.is_recovered ? 'recovered' : merged.probe_error_kind ? 'error' : 'active' });
+  }
+
+  const user = c.get('user') as Record<string, unknown>;
+  await logActivity(c.env.DB, 'batch_probe_account', `批量检测账号 ${updatedRows.length} / 请求 ${names.length}`, String(user?.username ?? ''));
+  return c.json({ ok: true, requested: names.length, succeeded: updatedRows.length, failed: names.length - updatedRows.length, results });
 });
 
 // ── Operations (async via waitUntil) ─────────────────────────────────

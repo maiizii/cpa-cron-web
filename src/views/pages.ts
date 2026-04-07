@@ -162,6 +162,7 @@ export function accountsPage(initialData?: AccountsInitialData): string {
       <td>${r.api_status_code != null ? String(r.api_status_code) : '-'}</td>
       <td style="white-space:nowrap;font-size:12px">${formatChinaTimeText(r.updated_at)}</td>
       <td>
+        <button class="btn btn-outline btn-sm" onclick="probeAccount(${jsEncodedName})">检测</button>
         <button class="btn btn-sm ${Number(r.disabled || 0) === 1 ? 'btn-primary' : 'btn-outline'}" onclick="toggleAccount(${jsEncodedName},${Number(r.disabled || 0) !== 1})">${Number(r.disabled || 0) === 1 ? '启用' : '禁用'}</button>
         <button class="btn btn-danger btn-sm" onclick="deleteAcc(${jsEncodedName})">删除</button>
       </td>
@@ -214,6 +215,7 @@ export function accountsPage(initialData?: AccountsInitialData): string {
       <input type="checkbox" id="selectAllPage" onchange="toggleSelectAllPage()"> 本页全选
     </label>
     <span id="selectedCount" style="font-size:13px;color:var(--text-dim)">已选 0 项</span>
+    <button class="btn btn-outline btn-sm" id="batchProbeBtn" onclick="batchProbe()" disabled>批量检测</button>
     <button class="btn btn-outline btn-sm" id="batchDisableBtn" onclick="batchToggle(true)" disabled>批量禁用</button>
     <button class="btn btn-primary btn-sm" id="batchEnableBtn" onclick="batchToggle(false)" disabled>批量启用</button>
     <button class="btn btn-danger btn-sm" id="batchDeleteBtn" onclick="batchDelete()" disabled>批量删除</button>
@@ -361,6 +363,7 @@ function syncSelectionBar() {
   const selectAll = document.getElementById('selectAllPage');
   if (selectAll) selectAll.checked = checkboxes.length > 0 && checked.length === checkboxes.length;
   document.getElementById('selectedCount').textContent = '已选 ' + selectedAccounts.size + ' 项';
+  document.getElementById('batchProbeBtn').disabled = selectedAccounts.size === 0;
   document.getElementById('batchDisableBtn').disabled = selectedAccounts.size === 0;
   document.getElementById('batchEnableBtn').disabled = selectedAccounts.size === 0;
   document.getElementById('batchDeleteBtn').disabled = selectedAccounts.size === 0;
@@ -407,6 +410,7 @@ async function loadAccounts() {
       + '<td>' + (r.api_status_code!=null?r.api_status_code:'-') + '</td>'
       + '<td style="white-space:nowrap;font-size:12px">' + window.formatChinaTime(r.updated_at) + '</td>'
       + '<td>'
+      + '<button class="btn btn-outline btn-sm" onclick="probeAccount(' + jsEncodedName + ')">检测</button>'
       + '<button class="btn btn-sm ' + (r.disabled?'btn-primary':'btn-outline') + '" onclick="toggleAccount(' + jsEncodedName + ',' + (!r.disabled) + ')">' + (r.disabled?'启用':'禁用') + '</button>'
       + '<button class="btn btn-danger btn-sm" onclick="deleteAcc(' + jsEncodedName + ')">删除</button>'
       + '</td>'
@@ -424,6 +428,42 @@ async function deleteAcc(name) {
   await api('/accounts/' + name, { method:'DELETE' });
   selectedAccounts.delete(name);
   loadAccounts();
+}
+
+async function probeAccount(name, silent) {
+  const decodedName = decodeURIComponent(name);
+  if (!silent && !confirm('确认检测账号「' + decodedName + '」？')) return false;
+  const data = await api('/accounts/' + name + '/probe', { method:'POST' });
+  if (data?.ok) {
+    await loadAccounts();
+    await refreshAccountMeta();
+    if (!silent && window.showToast) window.showToast('检测完成: ' + decodedName, 'success', 2500);
+    return true;
+  }
+  if (window.showToast) window.showToast((data && data.error) || ('检测失败: ' + decodedName), 'danger', 4000);
+  return false;
+}
+
+async function batchProbe() {
+  const names = getSelectedNames();
+  if (!names.length) return;
+  if (!confirm('确认批量检测 ' + names.length + ' 个账号？检测过程中会持续刷新列表。')) return;
+
+  const btn = document.getElementById('batchProbeBtn');
+  const oldHtml = btn.innerHTML;
+  btn.disabled = true;
+
+  let success = 0;
+  let failed = 0;
+  for (let i = 0; i < names.length; i++) {
+    btn.innerHTML = '<div class="spinner" style="width:14px;height:14px;border-width:2px"></div> 检测 ' + (i + 1) + '/' + names.length;
+    const ok = await probeAccount(encodeURIComponent(names[i]), true);
+    if (ok) success++; else failed++;
+  }
+
+  btn.disabled = false;
+  btn.innerHTML = oldHtml;
+  if (window.showToast) window.showToast('批量检测完成：成功 ' + success + '，失败 ' + failed, failed ? 'warning' : 'success', 4500);
 }
 
 async function batchToggle(disabled) {
@@ -664,6 +704,8 @@ window.syncSelectionBar = syncSelectionBar;
 window.toggleSelectAllPage = toggleSelectAllPage;
 window.toggleAccount = toggleAccount;
 window.deleteAcc = deleteAcc;
+window.probeAccount = probeAccount;
+window.batchProbe = batchProbe;
 window.batchToggle = batchToggle;
 window.batchDelete = batchDelete;
 window.quickScan = quickScan;
