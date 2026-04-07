@@ -907,8 +907,8 @@ export function historyPage(): string {
 <div class="table-wrapper">
   <div class="table-toolbar"><strong>扫描运行记录</strong></div>
   <table>
-    <thead><tr><th>ID</th><th>模式</th><th>状态</th><th>总文件</th><th>过滤</th><th>探测</th><th>401</th><th>限额</th><th>恢复</th><th>开始时间</th><th>结束时间</th></tr></thead>
-    <tbody id="historyBody"><tr><td colspan="11" style="text-align:center"><div class="spinner"></div></td></tr></tbody>
+    <thead><tr><th>ID</th><th>模式</th><th>状态</th><th>总文件</th><th>过滤</th><th>探测</th><th>401</th><th>限额</th><th>恢复</th><th>开始时间</th><th>结束时间</th><th>操作</th></tr></thead>
+    <tbody id="historyBody"><tr><td colspan="12" style="text-align:center"><div class="spinner"></div></td></tr></tbody>
   </table>
   <div class="pagination">
     <button id="prevBtn" onclick="changePage(-1)" disabled>&lt; 上一页</button>
@@ -927,17 +927,51 @@ async function load() {
   document.getElementById('prevBtn').disabled = currentPage === 0;
   document.getElementById('nextBtn').disabled = (currentPage+1)*pageSize >= total;
   const tbody = document.getElementById('historyBody');
-  if (!data.rows.length) { tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--text-dim)">暂无记录</td></tr>'; return; }
-  tbody.innerHTML = data.rows.map(r => \`
-    <tr>
-      <td>\${r.run_id}</td><td>\${r.mode}</td>
-      <td><span class="badge \${r.status==='success'?'badge-success':'badge-danger'}">\${r.status}</span></td>
-      <td>\${r.total_files}</td><td>\${r.filtered_files}</td><td>\${r.probed_files}</td>
-      <td>\${r.invalid_401_count}</td><td>\${r.quota_limited_count}</td><td>\${r.recovered_count}</td>
-      <td style="white-space:nowrap;font-size:12px">\${window.formatChinaTime(r.started_at)}</td>
-      <td style="white-space:nowrap;font-size:12px">\${window.formatChinaTime(r.finished_at)}</td>
-    </tr>
-  \`).join('');
+  if (!data.rows.length) { tbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--text-dim)">暂无记录</td></tr>'; return; }
+  tbody.innerHTML = data.rows.map(r => {
+    const isRunning = ['running', 'stopping', 'pending'].includes(String(r.status || ''));
+    const badge = r.status === 'success'
+      ? 'badge-success'
+      : r.status === 'stopped'
+        ? 'badge-warning'
+        : 'badge-danger';
+    return ''
+      + '<tr>'
+      + '<td>' + r.run_id + '</td><td>' + r.mode + '</td>'
+      + '<td><span class="badge ' + badge + '">' + r.status + '</span></td>'
+      + '<td>' + r.total_files + '</td><td>' + r.filtered_files + '</td><td>' + r.probed_files + '</td>'
+      + '<td>' + r.invalid_401_count + '</td><td>' + r.quota_limited_count + '</td><td>' + r.recovered_count + '</td>'
+      + '<td style="white-space:nowrap;font-size:12px">' + window.formatChinaTime(r.started_at) + '</td>'
+      + '<td style="white-space:nowrap;font-size:12px">' + window.formatChinaTime(r.finished_at) + '</td>'
+      + '<td>'
+      + (isRunning ? '<button class="btn btn-outline btn-sm" onclick="stopRun(' + Number(r.run_id) + ')">停止</button>' : '')
+      + '<button class="btn btn-danger btn-sm" onclick="deleteRun(' + Number(r.run_id) + ')" ' + (isRunning ? 'disabled' : '') + '>删除</button>'
+      + '</td>'
+      + '</tr>';
+  }).join('');
+}
+
+async function stopRun(id) {
+  if (!confirm('确认停止该扫描记录？这会直接把记录状态改为 stopped 并写入结束时间。')) return;
+  const data = await api('/scan-runs/' + id + '/stop', { method: 'POST' });
+  if (data?.ok) {
+    if (window.showToast) window.showToast('扫描记录已停止', 'success');
+    await load();
+  } else {
+    if (window.showToast) window.showToast(data?.error || '停止失败', 'danger');
+  }
+}
+
+async function deleteRun(id) {
+  if (!confirm('确认删除该扫描记录？删除后不可恢复。')) return;
+  const data = await api('/scan-runs/' + id, { method: 'DELETE' });
+  if (data?.ok) {
+    if (window.showToast) window.showToast('扫描记录已删除', 'success');
+    if (currentPage > 0 && total > 0 && (currentPage * pageSize) >= (total - 1)) currentPage--;
+    await load();
+  } else {
+    if (window.showToast) window.showToast(data?.error || '删除失败', 'danger');
+  }
 }
 load();
 </script>

@@ -2,6 +2,9 @@
  * D1 database access layer — mirrors the Python SQLite operations.
  */
 
+type D1Database = any;
+type D1Result = any;
+
 const AUTH_ACCOUNT_COLUMNS = [
   'name', 'disabled', 'id_token_json', 'email', 'provider', 'source',
   'unavailable', 'auth_index', 'account', 'type', 'runtime_only',
@@ -128,6 +131,34 @@ export async function getScanRuns(
     .bind(limit, offset)
     .all();
   return { rows: result.results as Record<string, unknown>[], total };
+}
+
+export async function getScanRunById(
+  db: D1Database,
+  runId: number
+): Promise<Record<string, unknown> | null> {
+  const row = await db.prepare('SELECT * FROM scan_runs WHERE run_id = ?').bind(runId).first();
+  return row as Record<string, unknown> | null;
+}
+
+export async function stopScanRunById(
+  db: D1Database,
+  runId: number,
+  status: 'stopped' | 'failed' = 'stopped'
+): Promise<boolean> {
+  const result = await db
+    .prepare("UPDATE scan_runs SET status = ?, finished_at = COALESCE(finished_at, ?) WHERE run_id = ? AND status IN ('running', 'stopping', 'pending')")
+    .bind(status, new Date().toISOString(), runId)
+    .run();
+  return Number(result.meta.changes || 0) > 0;
+}
+
+export async function deleteScanRunById(
+  db: D1Database,
+  runId: number
+): Promise<boolean> {
+  const result = await db.prepare('DELETE FROM scan_runs WHERE run_id = ?').bind(runId).run();
+  return Number(result.meta.changes || 0) > 0;
 }
 
 export async function getAccounts(
@@ -287,7 +318,7 @@ export async function deleteAccountsNotInSet(
 
   const existing = await db.prepare('SELECT name FROM auth_accounts').all<{ name: string }>();
   const keepSet = new Set(keepNames);
-  const staleNames = existing.results.map((r) => r.name).filter((n) => !keepSet.has(n));
+  const staleNames = (existing.results as Array<{ name: string }>).map((r: { name: string }) => r.name).filter((n: string) => !keepSet.has(n));
   if (staleNames.length === 0) return 0;
 
   for (let i = 0; i < staleNames.length; i += CHUNK) {

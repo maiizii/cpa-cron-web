@@ -12,6 +12,9 @@ import {
   deleteAccountFromDB,
   updateAccountDisabledState,
   getScanRuns,
+  getScanRunById,
+  stopScanRunById,
+  deleteScanRunById,
   getActivityLog,
   logActivity,
   getRecentTasks,
@@ -320,6 +323,32 @@ api.get('/scan-runs', async (c) => {
   return c.json(result);
 });
 
+api.post('/scan-runs/:id/stop', async (c) => {
+  const id = parseInt(c.req.param('id'), 10);
+  const run = await getScanRunById(c.env.DB, id);
+  if (!run) return c.json({ error: '扫描记录不存在' }, 404);
+  if (!['running', 'stopping', 'pending'].includes(String(run.status || ''))) {
+    return c.json({ ok: false, error: '当前扫描记录不可停止', status: run.status }, 400);
+  }
+  const ok = await stopScanRunById(c.env.DB, id, 'stopped');
+  const user = c.get('user') as Record<string, unknown>;
+  await logActivity(c.env.DB, 'scan_run_stop', `停止扫描记录: #${id}`, String(user?.username ?? ''));
+  return c.json({ ok, run_id: id, status: 'stopped' });
+});
+
+api.delete('/scan-runs/:id', async (c) => {
+  const id = parseInt(c.req.param('id'), 10);
+  const run = await getScanRunById(c.env.DB, id);
+  if (!run) return c.json({ error: '扫描记录不存在' }, 404);
+  if (['running', 'stopping', 'pending'].includes(String(run.status || ''))) {
+    return c.json({ ok: false, error: '运行中的扫描记录不可直接删除，请先停止' }, 400);
+  }
+  const ok = await deleteScanRunById(c.env.DB, id);
+  const user = c.get('user') as Record<string, unknown>;
+  await logActivity(c.env.DB, 'scan_run_delete', `删除扫描记录: #${id}`, String(user?.username ?? ''));
+  return c.json({ ok, run_id: id });
+});
+
 // ── Activity Log ─────────────────────────────────────────────────────
 
 api.get('/activity', async (c) => {
@@ -385,6 +414,11 @@ api.post('/tasks/:id/stop', async (c) => {
     status: 'stopping',
     error: null,
   });
+  const params = task.params ? JSON.parse(String(task.params)) : {};
+  const runId = Number((params && params.scan_run_id) || 0);
+  if (runId > 0) {
+    await stopScanRunById(c.env.DB, runId, 'stopped');
+  }
   return c.json({ ok: true, task_id: id, status: 'stopping' });
 });
 
