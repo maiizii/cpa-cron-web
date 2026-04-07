@@ -150,19 +150,23 @@ export function accountsPage(initialData?: AccountsInitialData): string {
   const initialRows = initialData?.rows || [];
   const initialTotal = initialData?.total || 0;
   const initialTbody = initialRows.length
-    ? initialRows.map((r) => `
+    ? initialRows.map((r) => {
+      const encodedName = encodeURIComponent(String(r.name || '')).replace(/'/g, '%27');
+      const jsEncodedName = JSON.stringify(encodedName);
+      return `
     <tr>
-      <td><input type="checkbox" class="account-check" value="${encodeURIComponent(String(r.name || ''))}" onchange="syncSelectionBar()"></td>
+      <td><input type="checkbox" class="account-check" value="${encodedName}" onchange="syncSelectionBar()"></td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis">${String(r.email || r.account || '-')}</td>
       <td>${String(r.provider || '-')}</td>
       <td>${Number(r.is_invalid_401 || 0) === 1 ? '<span class="badge badge-danger">401</span>' : Number(r.disabled || 0) === 1 && Number(r.is_quota_limited || 0) === 1 ? '<span class="badge badge-warning">限额已禁用</span>' : Number(r.is_quota_limited || 0) === 1 ? '<span class="badge badge-warning">限额</span>' : Number(r.disabled || 0) === 1 && Number(r.is_recovered || 0) === 1 ? '<span class="badge badge-info">可恢复</span>' : Number(r.is_recovered || 0) === 1 ? '<span class="badge badge-info">恢复</span>' : Number(r.disabled || 0) === 1 ? '<span class="badge badge-dim">禁用</span>' : r.probe_error_kind ? '<span class="badge badge-warning">异常</span>' : '<span class="badge badge-success">有效</span>'}</td>
       <td>${r.api_status_code != null ? String(r.api_status_code) : '-'}</td>
       <td style="white-space:nowrap;font-size:12px">${formatChinaTimeText(r.updated_at)}</td>
       <td>
-        <button class="btn btn-sm ${Number(r.disabled || 0) === 1 ? 'btn-primary' : 'btn-outline'}" onclick="toggleAccount('${encodeURIComponent(String(r.name || ''))}',${Number(r.disabled || 0) !== 1})">${Number(r.disabled || 0) === 1 ? '启用' : '禁用'}</button>
-        <button class="btn btn-danger btn-sm" onclick="deleteAcc('${encodeURIComponent(String(r.name || ''))}')">删除</button>
+        <button class="btn btn-sm ${Number(r.disabled || 0) === 1 ? 'btn-primary' : 'btn-outline'}" onclick="toggleAccount(${jsEncodedName},${Number(r.disabled || 0) !== 1})">${Number(r.disabled || 0) === 1 ? '启用' : '禁用'}</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteAcc(${jsEncodedName})">删除</button>
       </td>
-    </tr>`).join('')
+    </tr>`;
+    }).join('')
     : '<tr><td colspan="7" style="text-align:center;color:var(--text-dim)">暂无数据</td></tr>';
   return htmlLayout('账号管理', `
 <div id="accountsMetaAlert" style="display:none" class="alert alert-info" style="margin-bottom:16px"></div>
@@ -391,8 +395,9 @@ async function loadAccounts() {
     return;
   }
   tbody.innerHTML = data.rows.map(r => {
-    const encodedName = encodeURIComponent(r.name);
+    const encodedName = encodeURIComponent(String(r.name || '')).replace(/'/g, '%27');
     const checked = selectedAccounts.has(encodedName) ? 'checked' : '';
+    const jsEncodedName = JSON.stringify(encodedName);
     return ''
       + '<tr>'
       + '<td><input type="checkbox" class="account-check" value="' + encodedName + '" ' + checked + ' onchange="syncSelectionBar()"></td>'
@@ -402,8 +407,8 @@ async function loadAccounts() {
       + '<td>' + (r.api_status_code!=null?r.api_status_code:'-') + '</td>'
       + '<td style="white-space:nowrap;font-size:12px">' + window.formatChinaTime(r.updated_at) + '</td>'
       + '<td>'
-      + '<button class="btn btn-sm ' + (r.disabled?'btn-primary':'btn-outline') + '" onclick="toggleAccount(\'' + encodedName + '\',' + (!r.disabled) + ')">' + (r.disabled?'启用':'禁用') + '</button>'
-      + '<button class="btn btn-danger btn-sm" onclick="deleteAcc(\'' + encodedName + '\')">删除</button>'
+      + '<button class="btn btn-sm ' + (r.disabled?'btn-primary':'btn-outline') + '" onclick="toggleAccount(' + jsEncodedName + ',' + (!r.disabled) + ')">' + (r.disabled?'启用':'禁用') + '</button>'
+      + '<button class="btn btn-danger btn-sm" onclick="deleteAcc(' + jsEncodedName + ')">删除</button>'
       + '</td>'
       + '</tr>';
   }).join('');
