@@ -5,7 +5,7 @@ compatibility_flags = ["nodejs_compat"]
 
 [triggers]
 # Every 30 minutes: auto maintain accounts (scan + clear 401 + handle quota + re-enable recovered)
-crons = ["*/11 * * * *"]
+crons = ["*/5 * * * *"]
 
 # D1 Database — run `wrangler d1 create cpa-warden-db` and fill in the database_id
 [[d1_databases]]
